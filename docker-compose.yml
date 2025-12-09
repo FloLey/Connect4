@@ -1,0 +1,60 @@
+services:
+  # --- PostgreSQL Database ---
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: connect4_arena
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d connect4_arena"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- FastAPI Backend ---
+  backend:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # Internal Docker Network URL for DB  
+      - DATABASE_URL=postgresql+asyncpg://user:password@db:5432/connect4_arena
+      # Forward API Keys from host .env
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # HOT RELOAD: Map local folder to container
+      - ./backend:/app/backend
+
+  # --- React Frontend ---
+  frontend:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    depends_on:
+      - backend
+    volumes:
+      # HOT RELOAD: Map local folder to container
+      - ./frontend:/app
+      # PREVENT OVERWRITE: Keep container's node_modules isolated
+      - /app/node_modules
+
+volumes:
+  postgres_data:

@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 
+   REMOVE the hardcoded bg-slate-900 and text-white.
+   The Layout.jsx component now handles the theme background.
+*/
+body {
+  @apply antialiased min-h-screen;
+}
+
+/* Optional: Add a clean scrollbar for the new professional look */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300 dark:bg-gray-700 rounded-full;
+}
