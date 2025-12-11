@@ -64,6 +64,10 @@ class GameRunner:
                         print(f"🏁 Game {game_id} Finished in background.")
                         break
                         
+        except asyncio.CancelledError:
+            # Game was paused/cancelled - don't mark as failed, just exit
+            print(f"⏸️ Game {game_id} Paused/Cancelled")
+            raise  # Re-raise to ensure proper cleanup
         except Exception as e:
             print(f"❌ Background Runner Error (Game {game_id}): {e}")
         finally:

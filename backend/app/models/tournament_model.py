@@ -9,7 +9,7 @@ class Tournament(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    status = Column(String, default="SETUP") # SETUP, IN_PROGRESS, COMPLETED, STOPPED
+    status = Column(String, default="SETUP") # SETUP, IN_PROGRESS, PAUSED, COMPLETED, STOPPED
     
     # Config: { "concurrency": 5, "rounds": 2, "models": [...] }
     config = Column(JSONB, default=dict)

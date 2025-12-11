@@ -64,3 +64,45 @@ async def get_current_status(db: AsyncSession = Depends(get_db)):
         "total": t.total_matches,
         "completed": completed_count
     }
+
+class TournamentConfigUpdate(BaseModel):
+    concurrency: int
+
+@router.post("/{id}/pause")
+async def pause_tournament(id: int, db: AsyncSession = Depends(get_db)):
+    """Pause a tournament - stops all running games but preserves state."""
+    success = await tournament_service.pause_tournament(db, id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    return {"message": "Tournament paused"}
+
+@router.post("/{id}/resume")
+async def resume_tournament(id: int, db: AsyncSession = Depends(get_db)):
+    """Resume a paused tournament."""
+    result = await db.execute(select(Tournament).where(Tournament.id == id))
+    t = result.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    
+    if t.status != "PAUSED":
+        raise HTTPException(status_code=400, detail="Tournament is not paused")
+    
+    t.status = "IN_PROGRESS"
+    await db.commit()
+    
+    # Trigger tick to resume games
+    await tournament_service.tick(db)
+    
+    return {"message": "Tournament resumed"}
+
+@router.patch("/{id}/config")
+async def update_tournament_config(
+    id: int, 
+    payload: TournamentConfigUpdate, 
+    db: AsyncSession = Depends(get_db)
+):
+    """Update tournament configuration (e.g., concurrency limit)."""
+    success = await tournament_service.update_concurrency(db, id, payload.concurrency)
+    if not success:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    return {"message": "Tournament configuration updated"}

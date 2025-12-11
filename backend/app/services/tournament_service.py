@@ -100,6 +100,50 @@ class TournamentService:
             return True
         return False
 
+    async def pause_tournament(self, db: AsyncSession, tournament_id: int):
+        """Pause a tournament - stops all running games but preserves state."""
+        result = await db.execute(select(Tournament).where(Tournament.id == tournament_id))
+        t = result.scalar_one_or_none()
+        if not t:
+            return False
+        
+        # Update tournament status
+        t.status = "PAUSED"
+        await db.commit()
+        
+        # Find all IN_PROGRESS games for this tournament
+        games_query = await db.execute(
+            select(Game).where(
+                Game.tournament_id == tournament_id,
+                Game.status == "IN_PROGRESS"
+            )
+        )
+        games = games_query.scalars().all()
+        
+        # Stop all running games in GameRunner
+        for game in games:
+            await game_runner.stop_game(game.id)
+        
+        print(f"⏸️ Tournament {tournament_id} Paused ({len(games)} games stopped)")
+        return True
+
+    async def update_concurrency(self, db: AsyncSession, tournament_id: int, new_concurrency: int):
+        """Update concurrency limit for a tournament."""
+        result = await db.execute(select(Tournament).where(Tournament.id == tournament_id))
+        t = result.scalar_one_or_none()
+        if not t:
+            return False
+        
+        # Update concurrency in config
+        if "concurrency" not in t.config:
+            t.config["concurrency"] = new_concurrency
+        else:
+            t.config["concurrency"] = new_concurrency
+        
+        await db.commit()
+        print(f"⚙️ Tournament {tournament_id} concurrency updated to {new_concurrency}")
+        return True
+
     async def tick(self, db: AsyncSession):
         """
         The Heartbeat. Checks active tournament and feeds games to the runner.
@@ -116,35 +160,53 @@ class TournamentService:
 
         concurrency_limit = active_tournament.config.get("concurrency", 1)
         
-        # 2. Count currently running games for this tournament
-        # We check GameRunner memory + DB status for safety
-        running_query = await db.execute(
-            select(func.count(Game.id)).where(
+        # 2. Get all IN_PROGRESS games for this tournament
+        active_games_query = await db.execute(
+            select(Game).where(
                 and_(
                     Game.tournament_id == active_tournament.id,
                     Game.status == "IN_PROGRESS"
                 )
             )
         )
-        current_running = running_query.scalar() or 0
+        active_games_db = active_games_query.scalars().all()
+        
+        # 3. Count games actually running in memory (GameRunner)
+        current_running = 0
+        orphaned_games = []
+        for game in active_games_db:
+            if game_runner.is_game_running(game.id):
+                current_running += 1
+            else:
+                orphaned_games.append(game)
         
         slots_available = concurrency_limit - current_running
         
         if slots_available > 0:
-            # 3. Fetch next batch of PENDING games
-            # Prioritize lower rounds first
-            pending_query = await db.execute(
-                select(Game)
-                .where(
-                    and_(
-                        Game.tournament_id == active_tournament.id,
-                        Game.status == "PENDING"
+            games_to_start = []
+            
+            # 4. First, fill slots with orphaned games (resume paused games)
+            for game in orphaned_games:
+                if slots_available <= 0:
+                    break
+                games_to_start.append(game)
+                slots_available -= 1
+            
+            # 5. If slots still available, fetch PENDING games
+            if slots_available > 0:
+                pending_query = await db.execute(
+                    select(Game)
+                    .where(
+                        and_(
+                            Game.tournament_id == active_tournament.id,
+                            Game.status == "PENDING"
+                        )
                     )
+                    .order_by(Game.round_number.asc(), Game.id.asc())
+                    .limit(slots_available)
                 )
-                .order_by(Game.round_number.asc(), Game.id.asc())
-                .limit(slots_available)
-            )
-            games_to_start = pending_query.scalars().all()
+                pending_games = pending_query.scalars().all()
+                games_to_start.extend(pending_games)
             
             if not games_to_start and current_running == 0:
                 # No running games, no pending games -> Tournament Complete
@@ -153,10 +215,11 @@ class TournamentService:
                 print(f"🏆 Tournament {active_tournament.id} Completed!")
                 return
 
-            # 4. Launch them
+            # 6. Launch them
             for game in games_to_start:
-                game.status = "IN_PROGRESS"
-                await db.commit() # Commit status change first so other workers don't grab it
+                if game.status == "PENDING":
+                    game.status = "IN_PROGRESS"
+                    await db.commit() # Commit status change first so other workers don't grab it
                 
                 print(f"🚀 Tournament Launching: Game {game.id} (Round {game.round_number})")
                 await game_runner.start_game_if_ai_vs_ai(game.id)

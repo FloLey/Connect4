@@ -5,7 +5,8 @@ import {
 } from 'lucide-react';
 import { 
   getModels, createTournament, startTournament, 
-  stopTournament, getCurrentTournament, getActiveGames 
+  stopTournament, getCurrentTournament, getActiveGames,
+  pauseTournament, resumeTournament, updateTournamentConfig 
 } from '../api/client';
 import { Link } from 'react-router-dom';
 import MiniGameBoard from '../components/MiniGameBoard'; // Import new component
@@ -21,6 +22,10 @@ const Tournament = () => {
   const [activeTournament, setActiveTournament] = useState(null);
   const [activeGames, setActiveGames] = useState([]);
   const [loading, setLoading] = useState(true);
+  
+  // Pause/Resume State
+  const [editingConcurrency, setEditingConcurrency] = useState(2);
+  const [isUpdatingConfig, setIsUpdatingConfig] = useState(false);
 
   // 2. Add Ref
   // Stores the ID of a tournament the user has explicitly closed/reset
@@ -44,6 +49,8 @@ const Tournament = () => {
       // 3. Logic Update: Don't load if dismissed (edge case on re-mount)
       if (tournamentData && dismissedIdRef.current !== tournamentData.id) {
         setActiveTournament(tournamentData);
+        // Initialize editing concurrency with current config value
+        setEditingConcurrency(tournamentData.config?.concurrency || 2);
       }
       
       // Pre-select first 3 models if setup
@@ -68,6 +75,10 @@ const Tournament = () => {
       }
 
       setActiveTournament(t);
+      // Update editing concurrency with current config value
+      if (t) {
+        setEditingConcurrency(t.config?.concurrency || 2);
+      }
       
       if (t && t.status === 'IN_PROGRESS') {
         const games = await getActiveGames();
@@ -127,6 +138,48 @@ const Tournament = () => {
     }
   };
 
+  const handlePause = async () => {
+    if (!activeTournament) return;
+    try {
+      await pauseTournament(activeTournament.id);
+      // Optimistically update local state for instant feedback
+      setActiveTournament(prev => ({...prev, status: 'PAUSED'}));
+      refreshStatus();
+    } catch (e) {
+      alert("Failed to pause tournament");
+    }
+  };
+
+  const handleResume = async () => {
+    if (!activeTournament) return;
+    try {
+      await resumeTournament(activeTournament.id);
+      // Optimistically update local state for instant feedback
+      setActiveTournament(prev => ({...prev, status: 'IN_PROGRESS'}));
+      refreshStatus();
+    } catch (e) {
+      alert("Failed to resume tournament");
+    }
+  };
+
+  const handleUpdateConfig = async () => {
+    if (!activeTournament) return;
+    setIsUpdatingConfig(true);
+    try {
+      await updateTournamentConfig(activeTournament.id, editingConcurrency);
+      // Update local tournament config
+      setActiveTournament(prev => ({
+        ...prev,
+        config: {...prev.config, concurrency: editingConcurrency}
+      }));
+      alert("Configuration updated successfully");
+    } catch (e) {
+      alert("Failed to update configuration");
+    } finally {
+      setIsUpdatingConfig(false);
+    }
+  };
+
   const handleReset = () => {
     // 6. Logic Update: Mark current ID as dismissed
     if (activeTournament) {
@@ -162,8 +215,18 @@ const Tournament = () => {
               </button>
             )}
             {activeTournament.status === 'IN_PROGRESS' && (
-              <button onClick={handleStop} className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg flex items-center gap-2">
-                <Square size={18} /> Stop
+              <>
+                <button onClick={handlePause} className="bg-yellow-600 hover:bg-yellow-700 text-white px-4 py-2 rounded-lg flex items-center gap-2">
+                  <Square size={18} /> Pause
+                </button>
+                <button onClick={handleStop} className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg flex items-center gap-2">
+                  <Square size={18} /> Stop
+                </button>
+              </>
+            )}
+            {activeTournament.status === 'PAUSED' && (
+              <button onClick={handleResume} className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg flex items-center gap-2">
+                <Play size={18} /> Resume
               </button>
             )}
           </div>
@@ -191,8 +254,32 @@ const Tournament = () => {
              </div>
              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-lg">
                 <div className="text-gray-500">Concurrency</div>
-                {/* FIXED: Added Optional Chaining here */}
-                <div className="font-bold dark:text-white">{config.concurrency || 2} Workers</div>
+                {activeTournament.status === 'PAUSED' ? (
+                  <div className="space-y-2">
+                    <div className="flex justify-between items-center">
+                      <span className="font-bold dark:text-white">{editingConcurrency} Workers</span>
+                      <button 
+                        onClick={handleUpdateConfig}
+                        disabled={isUpdatingConfig}
+                        className="px-2 py-1 bg-brand-600 text-white text-xs rounded hover:bg-brand-700 disabled:opacity-50"
+                      >
+                        {isUpdatingConfig ? 'Saving...' : 'Save'}
+                      </button>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="1" 
+                      max="100" 
+                      step="1"
+                      value={editingConcurrency} 
+                      onChange={(e) => setEditingConcurrency(parseInt(e.target.value))}
+                      className="w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer accent-brand-600"
+                    />
+                    <p className="text-xs text-gray-500">Adjust while paused</p>
+                  </div>
+                ) : (
+                  <div className="font-bold dark:text-white">{config.concurrency || 2} Workers</div>
+                )}
              </div>
              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-lg">
                 <div className="text-gray-500">Rounds</div>

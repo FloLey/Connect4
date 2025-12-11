@@ -99,4 +99,22 @@ export const getCurrentTournament = async () => {
   const response = await apiClient.get('/tournament/current');
   return response.data; // Returns null if no tournament exists
 };
+
+// --- NEW: Tournament Pause/Resume/Config API ---
+export const pauseTournament = async (tournamentId) => {
+  const response = await apiClient.post(`/tournament/${tournamentId}/pause`);
+  return response.data;
+};
+
+export const resumeTournament = async (tournamentId) => {
+  const response = await apiClient.post(`/tournament/${tournamentId}/resume`);
+  return response.data;
+};
+
+export const updateTournamentConfig = async (tournamentId, concurrency) => {
+  const response = await apiClient.patch(`/tournament/${tournamentId}/config`, {
+    concurrency
+  });
+  return response.data;
+};
 // ----------------------

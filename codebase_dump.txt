@@ -1,4 +1,4 @@
---- VERSION 12 (CODE) START ---
+--- VERSION 14 (CODE) START ---
 
 --- Directory Tree Structure ---
 Project Root: /home/flore/projects/Connect4
@@ -448,6 +448,48 @@ async def get_current_status(db: AsyncSession = Depends(get_db)):
         "total": t.total_matches,
         "completed": completed_count
     }
+
+class TournamentConfigUpdate(BaseModel):
+    concurrency: int
+
+@router.post("/{id}/pause")
+async def pause_tournament(id: int, db: AsyncSession = Depends(get_db)):
+    """Pause a tournament - stops all running games but preserves state."""
+    success = await tournament_service.pause_tournament(db, id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    return {"message": "Tournament paused"}
+
+@router.post("/{id}/resume")
+async def resume_tournament(id: int, db: AsyncSession = Depends(get_db)):
+    """Resume a paused tournament."""
+    result = await db.execute(select(Tournament).where(Tournament.id == id))
+    t = result.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    
+    if t.status != "PAUSED":
+        raise HTTPException(status_code=400, detail="Tournament is not paused")
+    
+    t.status = "IN_PROGRESS"
+    await db.commit()
+    
+    # Trigger tick to resume games
+    await tournament_service.tick(db)
+    
+    return {"message": "Tournament resumed"}
+
+@router.patch("/{id}/config")
+async def update_tournament_config(
+    id: int, 
+    payload: TournamentConfigUpdate, 
+    db: AsyncSession = Depends(get_db)
+):
+    """Update tournament configuration (e.g., concurrency limit)."""
+    success = await tournament_service.update_concurrency(db, id, payload.concurrency)
+    if not success:
+        raise HTTPException(status_code=404, detail="Tournament not found")
+    return {"message": "Tournament configuration updated"}
 --- End of File: backend/app/api/tournament.py ---
 
 --- File: backend/app/api/websocket_manager.py ---
@@ -1277,7 +1319,7 @@ class Tournament(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    status = Column(String, default="SETUP") # SETUP, IN_PROGRESS, COMPLETED, STOPPED
+    status = Column(String, default="SETUP") # SETUP, IN_PROGRESS, PAUSED, COMPLETED, STOPPED
     
     # Config: { "concurrency": 5, "rounds": 2, "models": [...] }
     config = Column(JSONB, default=dict)
@@ -1399,6 +1441,10 @@ class GameRunner:
                         print(f"🏁 Game {game_id} Finished in background.")
                         break
                         
+        except asyncio.CancelledError:
+            # Game was paused/cancelled - don't mark as failed, just exit
+            print(f"⏸️ Game {game_id} Paused/Cancelled")
+            raise  # Re-raise to ensure proper cleanup
         except Exception as e:
             print(f"❌ Background Runner Error (Game {game_id}): {e}")
         finally:
@@ -1766,6 +1812,50 @@ class TournamentService:
             return True
         return False
 
+    async def pause_tournament(self, db: AsyncSession, tournament_id: int):
+        """Pause a tournament - stops all running games but preserves state."""
+        result = await db.execute(select(Tournament).where(Tournament.id == tournament_id))
+        t = result.scalar_one_or_none()
+        if not t:
+            return False
+        
+        # Update tournament status
+        t.status = "PAUSED"
+        await db.commit()
+        
+        # Find all IN_PROGRESS games for this tournament
+        games_query = await db.execute(
+            select(Game).where(
+                Game.tournament_id == tournament_id,
+                Game.status == "IN_PROGRESS"
+            )
+        )
+        games = games_query.scalars().all()
+        
+        # Stop all running games in GameRunner
+        for game in games:
+            await game_runner.stop_game(game.id)
+        
+        print(f"⏸️ Tournament {tournament_id} Paused ({len(games)} games stopped)")
+        return True
+
+    async def update_concurrency(self, db: AsyncSession, tournament_id: int, new_concurrency: int):
+        """Update concurrency limit for a tournament."""
+        result = await db.execute(select(Tournament).where(Tournament.id == tournament_id))
+        t = result.scalar_one_or_none()
+        if not t:
+            return False
+        
+        # Update concurrency in config
+        if "concurrency" not in t.config:
+            t.config["concurrency"] = new_concurrency
+        else:
+            t.config["concurrency"] = new_concurrency
+        
+        await db.commit()
+        print(f"⚙️ Tournament {tournament_id} concurrency updated to {new_concurrency}")
+        return True
+
     async def tick(self, db: AsyncSession):
         """
         The Heartbeat. Checks active tournament and feeds games to the runner.
@@ -1782,35 +1872,53 @@ class TournamentService:
 
         concurrency_limit = active_tournament.config.get("concurrency", 1)
         
-        # 2. Count currently running games for this tournament
-        # We check GameRunner memory + DB status for safety
-        running_query = await db.execute(
-            select(func.count(Game.id)).where(
+        # 2. Get all IN_PROGRESS games for this tournament
+        active_games_query = await db.execute(
+            select(Game).where(
                 and_(
                     Game.tournament_id == active_tournament.id,
                     Game.status == "IN_PROGRESS"
                 )
             )
         )
-        current_running = running_query.scalar() or 0
+        active_games_db = active_games_query.scalars().all()
+        
+        # 3. Count games actually running in memory (GameRunner)
+        current_running = 0
+        orphaned_games = []
+        for game in active_games_db:
+            if game_runner.is_game_running(game.id):
+                current_running += 1
+            else:
+                orphaned_games.append(game)
         
         slots_available = concurrency_limit - current_running
         
         if slots_available > 0:
-            # 3. Fetch next batch of PENDING games
-            # Prioritize lower rounds first
-            pending_query = await db.execute(
-                select(Game)
-                .where(
-                    and_(
-                        Game.tournament_id == active_tournament.id,
-                        Game.status == "PENDING"
+            games_to_start = []
+            
+            # 4. First, fill slots with orphaned games (resume paused games)
+            for game in orphaned_games:
+                if slots_available <= 0:
+                    break
+                games_to_start.append(game)
+                slots_available -= 1
+            
+            # 5. If slots still available, fetch PENDING games
+            if slots_available > 0:
+                pending_query = await db.execute(
+                    select(Game)
+                    .where(
+                        and_(
+                            Game.tournament_id == active_tournament.id,
+                            Game.status == "PENDING"
+                        )
                     )
+                    .order_by(Game.round_number.asc(), Game.id.asc())
+                    .limit(slots_available)
                 )
-                .order_by(Game.round_number.asc(), Game.id.asc())
-                .limit(slots_available)
-            )
-            games_to_start = pending_query.scalars().all()
+                pending_games = pending_query.scalars().all()
+                games_to_start.extend(pending_games)
             
             if not games_to_start and current_running == 0:
                 # No running games, no pending games -> Tournament Complete
@@ -1819,10 +1927,11 @@ class TournamentService:
                 print(f"🏆 Tournament {active_tournament.id} Completed!")
                 return
 
-            # 4. Launch them
+            # 6. Launch them
             for game in games_to_start:
-                game.status = "IN_PROGRESS"
-                await db.commit() # Commit status change first so other workers don't grab it
+                if game.status == "PENDING":
+                    game.status = "IN_PROGRESS"
+                    await db.commit() # Commit status change first so other workers don't grab it
                 
                 print(f"🚀 Tournament Launching: Game {game.id} (Round {game.round_number})")
                 await game_runner.start_game_if_ai_vs_ai(game.id)
@@ -2527,6 +2636,24 @@ export const stopTournament = async (tournamentId) => {
 export const getCurrentTournament = async () => {
   const response = await apiClient.get('/tournament/current');
   return response.data; // Returns null if no tournament exists
+};
+
+// --- NEW: Tournament Pause/Resume/Config API ---
+export const pauseTournament = async (tournamentId) => {
+  const response = await apiClient.post(`/tournament/${tournamentId}/pause`);
+  return response.data;
+};
+
+export const resumeTournament = async (tournamentId) => {
+  const response = await apiClient.post(`/tournament/${tournamentId}/resume`);
+  return response.data;
+};
+
+export const updateTournamentConfig = async (tournamentId, concurrency) => {
+  const response = await apiClient.patch(`/tournament/${tournamentId}/config`, {
+    concurrency
+  });
+  return response.data;
 };
 // ----------------------
 --- End of File: frontend/src/api/client.js ---
@@ -4207,9 +4334,11 @@ const Statistics = () => {
       const modelsList = lbData.map(m => m.model_name);
       setAllModels(modelsList);
       
-      // Default: Show top 5 models to avoid clutter
+      // --- LOGIC UPDATE HERE ---
+      // Old Code: setVisibleModels(modelsList.slice(0, 5));
+      // New Code: Set all models as visible by default
       if (visibleModels.length === 0) {
-        setVisibleModels(modelsList.slice(0, 5));
+        setVisibleModels(modelsList); 
       }
 
       processHistoryData(histData);
@@ -4220,31 +4349,42 @@ const Statistics = () => {
     }
   };
 
+  // 2. UPDATE: Data Processing Logic (Horizontal Extension)
   const processHistoryData = (rawHistory) => {
     const grouped = {};
-    // Group by model
+    // Group history entries by model name
     rawHistory.forEach(entry => {
       if (!grouped[entry.model_name]) grouped[entry.model_name] = [];
       grouped[entry.model_name].push(entry);
     });
 
-    // Find max length to create timeline
+    // Find the maximum number of games played by ANY model
     let maxGames = 0;
     Object.values(grouped).forEach(arr => {
       if (arr.length > maxGames) maxGames = arr.length;
     });
 
     const plotData = [];
-    // This assumes sequential indexing. Ideally backend sends timestamps.
-    // For now we map index 0..N across all models.
+    const lastRatings = {}; // Cache to store the last known rating for each model
+
+    // Iterate from 0 to maxGames to build the timeline
     for (let i = 0; i < maxGames; i++) {
       const point = { index: i + 1 };
+      
       Object.keys(grouped).forEach(model => {
+        // If this model has a game at this index (e.g., their 5th game)
         if (grouped[model][i]) {
-          // UPDATE: Round ELO scores to nearest integer
-          point[model] = Math.round(grouped[model][i].rating);
+          const val = Math.round(grouped[model][i].rating);
+          point[model] = val;
+          lastRatings[model] = val; // Update last known rating
+        } 
+        // If no game at this index, use the last known rating (Fill Forward)
+        else if (lastRatings[model] !== undefined) {
+          point[model] = lastRatings[model];
         }
+        // If lastRatings is undefined, the model hasn't played its 1st game yet; leave undefined.
       });
+      
       plotData.push(point);
     }
     setHistoryData(plotData);
@@ -4452,14 +4592,15 @@ export default Statistics;
 --- End of File: frontend/src/pages/Statistics.jsx ---
 
 --- File: frontend/src/pages/Tournament.jsx ---
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react'; // <--- Added useRef
 import { 
   Trophy, Play, Square, Settings, 
   Cpu, Activity, CheckCircle2, AlertCircle, RefreshCw, ArrowRight as ArrowIcon
 } from 'lucide-react';
 import { 
   getModels, createTournament, startTournament, 
-  stopTournament, getCurrentTournament, getActiveGames 
+  stopTournament, getCurrentTournament, getActiveGames,
+  pauseTournament, resumeTournament, updateTournamentConfig 
 } from '../api/client';
 import { Link } from 'react-router-dom';
 import MiniGameBoard from '../components/MiniGameBoard'; // Import new component
@@ -4475,6 +4616,14 @@ const Tournament = () => {
   const [activeTournament, setActiveTournament] = useState(null);
   const [activeGames, setActiveGames] = useState([]);
   const [loading, setLoading] = useState(true);
+  
+  // Pause/Resume State
+  const [editingConcurrency, setEditingConcurrency] = useState(2);
+  const [isUpdatingConfig, setIsUpdatingConfig] = useState(false);
+
+  // 2. Add Ref
+  // Stores the ID of a tournament the user has explicitly closed/reset
+  const dismissedIdRef = useRef(null); 
 
   // --- Initialization & Polling ---
   useEffect(() => {
@@ -4490,7 +4639,13 @@ const Tournament = () => {
         getCurrentTournament()
       ]);
       setAvailableModels(modelsData);
-      setActiveTournament(tournamentData);
+
+      // 3. Logic Update: Don't load if dismissed (edge case on re-mount)
+      if (tournamentData && dismissedIdRef.current !== tournamentData.id) {
+        setActiveTournament(tournamentData);
+        // Initialize editing concurrency with current config value
+        setEditingConcurrency(tournamentData.config?.concurrency || 2);
+      }
       
       // Pre-select first 3 models if setup
       if (!tournamentData && modelsData.length >= 3) {
@@ -4506,12 +4661,26 @@ const Tournament = () => {
   const refreshStatus = async () => {
     try {
       const t = await getCurrentTournament();
+      
+      // 4. Logic Update: THE FIX
+      // If the backend returns a tournament that matches our dismissed ID, ignore it.
+      if (t && dismissedIdRef.current === t.id) {
+        return; 
+      }
+
       setActiveTournament(t);
+      // Update editing concurrency with current config value
+      if (t) {
+        setEditingConcurrency(t.config?.concurrency || 2);
+      }
+      
       if (t && t.status === 'IN_PROGRESS') {
         const games = await getActiveGames();
-        // Filter only games belonging to tournament if needed, 
-        // but active-games endpoint returns all IN_PROGRESS.
-        // For visual flair, we just show all active games here.
+        
+        // --- NEW LOGIC: STABLE SORT ---
+        // Sort games by ID so they don't change positions in the grid during updates
+        games.sort((a, b) => a.id - b.id);
+        
         setActiveGames(games);
       }
     } catch (e) {
@@ -4530,6 +4699,9 @@ const Tournament = () => {
     if (selectedModels.length < 2) return alert("Select at least 2 models");
     setLoading(true);
     try {
+      // 5. Logic Update: Reset dismissal ref for the NEW tournament
+      dismissedIdRef.current = null;
+      
       const t = await createTournament(selectedModels, rounds, concurrency);
       setActiveTournament(t);
     } catch (e) {
@@ -4560,10 +4732,53 @@ const Tournament = () => {
     }
   };
 
+  const handlePause = async () => {
+    if (!activeTournament) return;
+    try {
+      await pauseTournament(activeTournament.id);
+      // Optimistically update local state for instant feedback
+      setActiveTournament(prev => ({...prev, status: 'PAUSED'}));
+      refreshStatus();
+    } catch (e) {
+      alert("Failed to pause tournament");
+    }
+  };
+
+  const handleResume = async () => {
+    if (!activeTournament) return;
+    try {
+      await resumeTournament(activeTournament.id);
+      // Optimistically update local state for instant feedback
+      setActiveTournament(prev => ({...prev, status: 'IN_PROGRESS'}));
+      refreshStatus();
+    } catch (e) {
+      alert("Failed to resume tournament");
+    }
+  };
+
+  const handleUpdateConfig = async () => {
+    if (!activeTournament) return;
+    setIsUpdatingConfig(true);
+    try {
+      await updateTournamentConfig(activeTournament.id, editingConcurrency);
+      // Update local tournament config
+      setActiveTournament(prev => ({
+        ...prev,
+        config: {...prev.config, concurrency: editingConcurrency}
+      }));
+      alert("Configuration updated successfully");
+    } catch (e) {
+      alert("Failed to update configuration");
+    } finally {
+      setIsUpdatingConfig(false);
+    }
+  };
+
   const handleReset = () => {
-    // Just clear local state to show form again. 
-    // Real reset would require a new API endpoint to "archive" the tournament or just creating a new one overrides the old setup.
-    // For this MVP, we just allow creating a new one which overrides "SETUP" status.
+    // 6. Logic Update: Mark current ID as dismissed
+    if (activeTournament) {
+      dismissedIdRef.current = activeTournament.id;
+    }
     setActiveTournament(null); 
   };
 
@@ -4594,8 +4809,18 @@ const Tournament = () => {
               </button>
             )}
             {activeTournament.status === 'IN_PROGRESS' && (
-              <button onClick={handleStop} className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg flex items-center gap-2">
-                <Square size={18} /> Stop
+              <>
+                <button onClick={handlePause} className="bg-yellow-600 hover:bg-yellow-700 text-white px-4 py-2 rounded-lg flex items-center gap-2">
+                  <Square size={18} /> Pause
+                </button>
+                <button onClick={handleStop} className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg flex items-center gap-2">
+                  <Square size={18} /> Stop
+                </button>
+              </>
+            )}
+            {activeTournament.status === 'PAUSED' && (
+              <button onClick={handleResume} className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg flex items-center gap-2">
+                <Play size={18} /> Resume
               </button>
             )}
           </div>
@@ -4623,8 +4848,32 @@ const Tournament = () => {
              </div>
              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-lg">
                 <div className="text-gray-500">Concurrency</div>
-                {/* FIXED: Added Optional Chaining here */}
-                <div className="font-bold dark:text-white">{config.concurrency || 2} Workers</div>
+                {activeTournament.status === 'PAUSED' ? (
+                  <div className="space-y-2">
+                    <div className="flex justify-between items-center">
+                      <span className="font-bold dark:text-white">{editingConcurrency} Workers</span>
+                      <button 
+                        onClick={handleUpdateConfig}
+                        disabled={isUpdatingConfig}
+                        className="px-2 py-1 bg-brand-600 text-white text-xs rounded hover:bg-brand-700 disabled:opacity-50"
+                      >
+                        {isUpdatingConfig ? 'Saving...' : 'Save'}
+                      </button>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="1" 
+                      max="100" 
+                      step="1"
+                      value={editingConcurrency} 
+                      onChange={(e) => setEditingConcurrency(parseInt(e.target.value))}
+                      className="w-full h-2 bg-gray-300 rounded-lg appearance-none cursor-pointer accent-brand-600"
+                    />
+                    <p className="text-xs text-gray-500">Adjust while paused</p>
+                  </div>
+                ) : (
+                  <div className="font-bold dark:text-white">{config.concurrency || 2} Workers</div>
+                )}
              </div>
              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-lg">
                 <div className="text-gray-500">Rounds</div>
@@ -5214,6 +5463,7 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.env
 
 --- End of File: .gitignore ---
 
@@ -5774,4 +6024,4 @@ volumes:
   postgres_data:
 --- End of File: docker-compose.yml ---
 
---- VERSION 12 END ---
+--- VERSION 14 END ---
