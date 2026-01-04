@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { getLeaderboard, getMatrix, getHistory } from '../api/client';
+import { getLeaderboard, getMatrix, getHistoryPlot } from '../api/client';
 import { 
   BarChart2, RefreshCw, Zap, Clock, Coins, Activity, 
   Maximize2, X, ChevronDown, ChevronUp, Table as TableIcon, Filter
 } from 'lucide-react';
+import { useDatabase } from '../context/DatabaseContext';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip, Legend, ResponsiveContainer,
   ScatterChart, Scatter, ZAxis, LabelList, Brush, ReferenceLine
@@ -164,52 +165,59 @@ const HistoryPlotView = ({ data, models, visibleModels, toggleModel }) => {
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={data} margin={{ top: 5, right: 30, left: 0, bottom: 5 }}>
             <CartesianGrid strokeDasharray="3 3" opacity={0.1} vertical={false} />
+            
+            {/* UPDATED X-AXIS */}
             <XAxis 
-              dataKey="index" 
+              dataKey="match_number" 
+              type="number" 
+              domain={[0, 'auto']} // Forces start at 0
               stroke="#9ca3af" 
               tick={{fontSize: 12}}
-              label={{ value: 'Games Played (Chronological)', position: 'insideBottom', offset: -5, fill: '#6b7280', fontSize: 12 }} 
+              allowDecimals={false}
+              label={{ value: 'Games Played (Per Model)', position: 'insideBottom', offset: -5, fill: '#6b7280', fontSize: 12 }} 
             />
+            
             <YAxis 
               domain={['auto', 'auto']} 
               stroke="#9ca3af" 
               tick={{fontSize: 12}}
               width={40}
-              allowDecimals={false} // Force integers on Axis
+              allowDecimals={false} 
             />
             
-            {/* Reference Line at Starting ELO */}
-            <ReferenceLine y={1200} stroke="#9ca3af" strokeDasharray="3 3" label={{ value: 'Base 1200', position: 'right', fill: '#9ca3af', fontSize: 10 }} />
+            {/* Baseline Reference */}
+            <ReferenceLine y={1200} stroke="#9ca3af" strokeDasharray="3 3" />
 
+            {/* Tooltip formatter update */}
             <ReTooltip 
               contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151', borderRadius: '8px', color: '#fff', fontSize: '12px' }}
-              itemStyle={{ padding: 0 }}
-              labelStyle={{ color: '#9ca3af', marginBottom: '0.5rem' }}
+              labelFormatter={(value) => `Game #${value}`}
             />
             
             {models.map((modelName, index) => (
               visibleModels.includes(modelName) && (
                 <Line 
                   key={modelName}
-                  type="linear" // UPDATE: Straight lines (no smoothing)
+                  type="linear" 
                   dataKey={modelName} 
                   stroke={getModelColor(modelName, index)} 
                   strokeWidth={2}
                   dot={false} 
                   activeDot={{ r: 6, strokeWidth: 0 }} 
+                  
+                  // CRITICAL: Connects dots across empty data points
                   connectNulls={true} 
+                  
                   isAnimationActive={false} 
                 />
               )
             ))}
             
-            {/* Zoom Slider */}
             <Brush 
-              dataKey="index" 
+              dataKey="match_number" 
               height={30} 
               stroke="#4b5563" 
               fill="transparent" 
-              tickFormatter={() => ''}
             />
           </LineChart>
         </ResponsiveContainer>
@@ -219,6 +227,7 @@ const HistoryPlotView = ({ data, models, visibleModels, toggleModel }) => {
 };
 
 const Statistics = () => {
+  const { dbEnv } = useDatabase();
   const [leaderboard, setLeaderboard] = useState([]);
   const [matrix, setMatrix] = useState(null);
   const [historyData, setHistoryData] = useState([]);
@@ -235,25 +244,18 @@ const Statistics = () => {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [lbData, matrixData, histData] = await Promise.all([
+      const [lbData, matrixData, plotData] = await Promise.all([
         getLeaderboard(),
         getMatrix(),
-        getHistory()
+        getHistoryPlot() // <--- Use the new optimized endpoint
       ]);
       setLeaderboard(lbData);
       setMatrix(matrixData);
+      setHistoryData(plotData); // <--- No more processHistoryData needed!
       
       const modelsList = lbData.map(m => m.model_name);
       setAllModels(modelsList);
-      
-      // --- LOGIC UPDATE HERE ---
-      // Old Code: setVisibleModels(modelsList.slice(0, 5));
-      // New Code: Set all models as visible by default
-      if (visibleModels.length === 0) {
-        setVisibleModels(modelsList); 
-      }
-
-      processHistoryData(histData);
+      if (visibleModels.length === 0) setVisibleModels(modelsList);
     } catch (e) {
       console.error(e);
     } finally {
@@ -261,50 +263,15 @@ const Statistics = () => {
     }
   };
 
-  // 2. UPDATE: Data Processing Logic (Horizontal Extension)
-  const processHistoryData = (rawHistory) => {
-    const grouped = {};
-    // Group history entries by model name
-    rawHistory.forEach(entry => {
-      if (!grouped[entry.model_name]) grouped[entry.model_name] = [];
-      grouped[entry.model_name].push(entry);
-    });
-
-    // Find the maximum number of games played by ANY model
-    let maxGames = 0;
-    Object.values(grouped).forEach(arr => {
-      if (arr.length > maxGames) maxGames = arr.length;
-    });
-
-    const plotData = [];
-    const lastRatings = {}; // Cache to store the last known rating for each model
-
-    // Iterate from 0 to maxGames to build the timeline
-    for (let i = 0; i < maxGames; i++) {
-      const point = { index: i + 1 };
-      
-      Object.keys(grouped).forEach(model => {
-        // If this model has a game at this index (e.g., their 5th game)
-        if (grouped[model][i]) {
-          const val = Math.round(grouped[model][i].rating);
-          point[model] = val;
-          lastRatings[model] = val; // Update last known rating
-        } 
-        // If no game at this index, use the last known rating (Fill Forward)
-        else if (lastRatings[model] !== undefined) {
-          point[model] = lastRatings[model];
-        }
-        // If lastRatings is undefined, the model hasn't played its 1st game yet; leave undefined.
-      });
-      
-      plotData.push(point);
-    }
-    setHistoryData(plotData);
-  };
 
   useEffect(() => {
+    setLoading(true);
+    setLeaderboard([]); // Clear stale data
+    setMatrix(null);
+    setHistoryData([]);
+    
     fetchData();
-  }, []);
+  }, [dbEnv]);
 
   const toggleModelVisibility = (modelName) => {
     setVisibleModels(prev => 

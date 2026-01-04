@@ -9,7 +9,9 @@ from datetime import datetime
 from backend.app.core.database import get_db
 from backend.app.models.elo_model import EloRating, EloHistory
 from backend.app.models.game_model import Game
-from backend.app.engine.ai import MODEL_PROVIDERS
+from backend.app.models.enums import GameStatus
+from backend.app.core.model_registry import registry
+from backend.app.engine.game import ConnectFour
 
 router = APIRouter()
 
@@ -83,7 +85,8 @@ async def get_leaderboard(db: AsyncSession = Depends(get_db)):
         
         # 3. Cost Calculations (USD)
         # Pricing is per 1 Million tokens
-        pricing = MODEL_PROVIDERS.get(r.model_name, {}).get("pricing", {"input": 0, "output": 0})
+        config = registry.get(r.model_name)
+        pricing = config.pricing if config else {"input": 0, "output": 0}
         
         cost_input = (r.total_input_tokens or 0) / 1_000_000 * pricing.get("input", 0)
         cost_output = (r.total_output_tokens or 0) / 1_000_000 * pricing.get("output", 0)
@@ -124,30 +127,73 @@ async def get_rating_history(model: str = None, db: AsyncSession = Depends(get_d
     result = await db.execute(query)
     return result.scalars().all()
 
+@router.get("/history-plot")
+async def get_history_plot_data(db: AsyncSession = Depends(get_db)):
+    """
+    Returns data formatted for Recharts where X-axis = Personal Match Count.
+    Example: 
+      [
+        { "match_number": 0, "gpt-4": 1200, "claude": 1200 },
+        { "match_number": 1, "gpt-4": 1210 },  <-- gpt-4's 1st game
+        { "match_number": 1, "claude": 1190 }  <-- claude's 1st game (happened much later in real time)
+      ]
+    """
+    # 1. Fetch ALL history ordered by timestamp (ASC)
+    result = await db.execute(select(EloHistory).order_by(EloHistory.timestamp.asc()))
+    records = result.scalars().all()
+
+    # 2. Identify all models present in history
+    all_models = set(r.model_name for r in records)
+
+    # 3. Initialize separate counters for each model
+    # This tracks "How many games has THIS model played so far?"
+    model_counters = {m: 0 for m in all_models}
+
+    # 4. Initialize Data Structure
+    # data_map key = The personal match number (0, 1, 2...)
+    data_map = {}
+
+    # Initialize Baseline (Game 0)
+    data_map[0] = { "match_number": 0 }
+    for m in all_models:
+        data_map[0][m] = 1200  # Everyone starts at 1200
+
+    # 5. Aggregate Data
+    for record in records:
+        model = record.model_name
+        
+        # Increment ONLY this model's counter
+        model_counters[model] += 1
+        current_match_num = model_counters[model]
+
+        # Ensure the row exists in our result set
+        if current_match_num not in data_map:
+            data_map[current_match_num] = { "match_number": current_match_num }
+        
+        # Add the rating
+        data_map[current_match_num][model] = round(record.rating)
+
+    # 6. Sort by match number (0, 1, 2, 3...)
+    plot_data = sorted(data_map.values(), key=lambda x: x["match_number"])
+    
+    # Return ALL data (removed the [-500:] slice)
+    return plot_data
+
 @router.get("/active-games", response_model=List[LiveGameSummary])
 async def get_active_games(db: AsyncSession = Depends(get_db)):
     """Returns games currently IN_PROGRESS with reconstructed board state."""
-    query = select(Game).where(Game.status == "IN_PROGRESS").order_by(desc(Game.created_at)).limit(20)
+    query = select(Game).where(Game.status == GameStatus.IN_PROGRESS).order_by(desc(Game.created_at)).limit(20)
     result = await db.execute(query)
     games = result.scalars().all()
     
     summaries = []
     for g in games:
-        # Reconstruct board state (6x7)
-        # 0=Empty, 1=Player1, 2=Player2
-        board = [[0 for _ in range(7)] for _ in range(6)]
-        
+        # Use ConnectFour engine to reconstruct board state
         if g.history:
-            for move in g.history:
-                col = move.get('column')
-                player = move.get('player')
-                
-                if col is not None and 0 <= col < 7:
-                    # Gravity logic: find lowest empty row
-                    for r in range(5, -1, -1):
-                        if board[r][col] == 0:
-                            board[r][col] = player
-                            break
+            game_engine = ConnectFour.from_history(g.history)
+            board = game_engine.board
+        else:
+            board = [[0 for _ in range(7)] for _ in range(6)]
 
         summaries.append(LiveGameSummary(
             id=g.id,
@@ -174,7 +220,7 @@ async def get_win_rate_matrix(db: AsyncSession = Depends(get_db)):
     # 2. Get all completed games
     games_result = await db.execute(
         select(Game.player_1_type, Game.player_2_type, Game.winner)
-        .where(Game.status.in_(["COMPLETED", "DRAW"]))
+        .where(Game.status.in_([GameStatus.COMPLETED, GameStatus.DRAW]))
     )
     games = games_result.all()
     
