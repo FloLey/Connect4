@@ -5,10 +5,11 @@ import sys
 # Add project root to path so we can import from backend.app
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
 
-from backend.app.engine.ai import MODEL_PROVIDERS, get_llm
+from backend.app.engine.ai import get_llm
+from backend.app.core.model_registry import registry
 
 async def test_model(name, config):
-    print(f"Testing {name} [{config['provider']}]...", end=" ", flush=True)
+    print(f"Testing {name} [{config.provider}]...", end=" ", flush=True)
     try:
         llm = get_llm(name)
         # Send a tiny prompt to verify connectivity
@@ -25,7 +26,7 @@ async def main():
     results = []
     
     # Sort keys for consistent output
-    sorted_models = sorted(MODEL_PROVIDERS.items())
+    sorted_models = sorted(registry.list_all().items())
     
     for name, config in sorted_models:
         success = await test_model(name, config)

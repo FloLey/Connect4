@@ -2,8 +2,11 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { createGame, getModels } from '../api/client';
 import { Bot, User, Sword, Shuffle } from 'lucide-react';
+import { useDatabase } from '../context/DatabaseContext';
+import { saveGameTokenWithTimestamp } from '../utils/tokenCleanup';
 
 const NewGame = () => {
+  const { dbEnv } = useDatabase();
   const navigate = useNavigate();
   const [models, setModels] = useState([]); // Dynamic List
   const [loadingModels, setLoadingModels] = useState(true);
@@ -16,7 +19,7 @@ const NewGame = () => {
   
   const [loading, setLoading] = useState(false);
 
-  // 1. Fetch Models on Mount
+  // 1. Fetch Models on Mount and when dbEnv changes
   useEffect(() => {
     const fetchModels = async () => {
       try {
@@ -33,7 +36,7 @@ const NewGame = () => {
       }
     };
     fetchModels();
-  }, []);
+  }, [dbEnv]);
 
   const handleRandomize = () => {
     if (models.length < 2) return;
@@ -64,6 +67,11 @@ const NewGame = () => {
       const player2 = p2Type === 'human' ? 'human' : p2Model;
       
       const game = await createGame(player1, player2);
+      
+      // Save tokens if they exist in response (with timestamps for cleanup)
+      if (game.player_1_token) saveGameTokenWithTimestamp(game.id, game.player_1_token);
+      if (game.player_2_token) saveGameTokenWithTimestamp(game.id, game.player_2_token);
+      
       navigate(`/game/${game.id}`);
     } catch (error) {
       console.error(error);

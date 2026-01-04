@@ -8,39 +8,49 @@ even if users close their browsers.
 
 import asyncio
 from sqlalchemy.future import select
-from backend.app.core.database import AsyncSessionLocal
+from backend.app.core.database import get_session_maker
 from backend.app.models.game_model import Game
+from backend.app.models.enums import GameStatus, PlayerType
 from backend.app.services.game_service import game_service, GameState
 
 
 class GameRunner:
     def __init__(self):
-        self.running_tasks = {}  # game_id -> asyncio.Task
+        self.running_tasks = {}  # key format: "{env}_{game_id}" -> asyncio.Task
 
-    async def start_game_if_ai_vs_ai(self, game_id: int):
+    def _make_key(self, env, game_id):
+        return f"{env}_{game_id}"
+
+    async def start_game_if_ai_vs_ai(self, game_id: int, env: str = "prod"):
         """Checks if a game is AI vs AI and starts the background loop if so."""
-        async with AsyncSessionLocal() as db:
+        key = self._make_key(env, game_id)
+        if key in self.running_tasks:
+            return  # Already running
+        
+        SessionLocal = get_session_maker(env)
+        async with SessionLocal() as db:
             game, _ = await game_service.get_game_state(db, game_id)
             
             # Condition: Both players are AI
-            is_ai_vs_ai = (game.player_1_type != "human" and game.player_2_type != "human")
+            is_ai_vs_ai = (game.player_1_type != PlayerType.HUMAN and game.player_2_type != PlayerType.HUMAN)
             
-            if is_ai_vs_ai and game.status == "IN_PROGRESS":
-                if game_id not in self.running_tasks:
-                    print(f"🚀 Starting Background Runner for Game {game_id}")
-                    self.running_tasks[game_id] = asyncio.create_task(self._game_loop(game_id))
+            if is_ai_vs_ai and game.status == GameStatus.IN_PROGRESS:
+                print(f"🚀 Starting Background Runner for Game {game_id} in [{env}]")
+                self.running_tasks[key] = asyncio.create_task(self._game_loop(game_id, env))
 
-    async def _game_loop(self, game_id: int):
+    async def _game_loop(self, game_id: int, env: str):
         """The main loop that plays the game until completion."""
         # Late import to avoid circular imports
         from backend.app.api.websocket_manager import manager
         
+        key = self._make_key(env, game_id)
         try:
             while True:
                 # 1. Brief pause to simulate thinking/pacing
                 await asyncio.sleep(1.5)
 
-                async with AsyncSessionLocal() as db:
+                SessionLocal = get_session_maker(env)
+                async with SessionLocal() as db:
                     # 2. Execute Step
                     # Note: step_ai_turn handles locking and validation internally
                     new_state = await game_service.step_ai_turn(db, game_id)
@@ -60,7 +70,7 @@ class GameRunner:
                     })
 
                     # 4. Check Exit Conditions
-                    if new_state.winner or new_state.is_draw or new_state.status != "IN_PROGRESS":
+                    if new_state.winner or new_state.is_draw or new_state.status != GameStatus.IN_PROGRESS:
                         print(f"🏁 Game {game_id} Finished in background.")
                         break
                         
@@ -71,19 +81,21 @@ class GameRunner:
         except Exception as e:
             print(f"❌ Background Runner Error (Game {game_id}): {e}")
         finally:
-            if game_id in self.running_tasks:
-                del self.running_tasks[game_id]
+            if key in self.running_tasks:
+                del self.running_tasks[key]
 
-    def is_game_running(self, game_id: int) -> bool:
+    def is_game_running(self, game_id: int, env: str = "prod") -> bool:
         """Check if a game is currently being processed in background."""
-        return game_id in self.running_tasks
+        key = self._make_key(env, game_id)
+        return key in self.running_tasks
 
-    async def stop_game(self, game_id: int):
+    async def stop_game(self, game_id: int, env: str = "prod"):
         """Stop background processing for a specific game."""
-        if game_id in self.running_tasks:
-            self.running_tasks[game_id].cancel()
-            del self.running_tasks[game_id]
-            print(f"🛑 Stopped Background Runner for Game {game_id}")
+        key = self._make_key(env, game_id)
+        if key in self.running_tasks:
+            self.running_tasks[key].cancel()
+            del self.running_tasks[key]
+            print(f"🛑 Stopped Background Runner for Game {game_id} in [{env}]")
 
 
 # Singleton

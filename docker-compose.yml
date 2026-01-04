@@ -7,10 +7,12 @@ services:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
       POSTGRES_DB: connect4_arena
+      POSTGRES_MULTIPLE_DATABASES: connect4_arena,connect4_test
     ports:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./backend/scripts/create-multiple-databases.sh:/docker-entrypoint-initdb.d/create-multiple-databases.sh
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U user -d connect4_arena"]
       interval: 5s
@@ -24,20 +26,23 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
+    # Load variables directly from the backend/.env file
+    env_file:
+      - ./backend/.env
     environment:
-      # Internal Docker Network URL for DB  
+      # Internal Docker Network URL for DB (Overrides value in .env file)
       - DATABASE_URL=postgresql+asyncpg://user:password@db:5432/connect4_arena
-      # Forward API Keys from host .env
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - TEST_DATABASE_URL=postgresql+asyncpg://user:password@db:5432/connect4_test
+      # REMOVED: Explicit API Key mappings that relied on shell interpolation
+      # The keys (OPENAI, MISTRAL, etc.) are now loaded automatically from env_file
     depends_on:
       db:
         condition: service_healthy
     volumes:
       # HOT RELOAD: Map local folder to container
       - ./backend:/app/backend
+      # --- NEW MOUNT ---
+      - ./training:/app/training
 
   # --- React Frontend ---
   frontend:

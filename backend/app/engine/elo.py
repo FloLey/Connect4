@@ -103,3 +103,7 @@ async def update_elo(db: AsyncSession, model_a_name: str, model_b_name: str, win
     db.add(hist_b)
     
     # Caller must await db.commit()
+
+async def update_elo_on_complete(db, game, winner_id):
+    """Wrapper for update_elo to match event listener signature"""
+    await update_elo(db, game.player_1_type, game.player_2_type, winner_id, game.id)

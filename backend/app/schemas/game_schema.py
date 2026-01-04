@@ -1,6 +1,7 @@
 from pydantic import BaseModel, ConfigDict
 from typing import List, Optional, Any
 from datetime import datetime
+from backend.app.models.enums import PlayerType
 
 class MoveRecord(BaseModel):
     # Allow extra fields in the JSON to prevent crashes if schema evolves
@@ -18,8 +19,8 @@ class MoveRecord(BaseModel):
     duration: Optional[float] = 0.0
 
 class GameCreate(BaseModel):
-    player_1: str = "human"
-    player_2: str = "ai"
+    player_1: str = PlayerType.HUMAN
+    player_2: str = PlayerType.AI
 
 class GameResponse(BaseModel):
     id: int
@@ -32,6 +33,8 @@ class GameResponse(BaseModel):
     created_at: datetime
     player_1_type: str
     player_2_type: str
+    player_1_token: Optional[str] = None
+    player_2_token: Optional[str] = None
 
     class Config:
         from_attributes = True

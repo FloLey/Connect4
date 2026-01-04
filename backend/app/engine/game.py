@@ -119,3 +119,10 @@ class ConnectFour:
             desc = ", ".join(pieces) if pieces else "Empty"
             lines.append(f"Column {c}: {desc}")
         return "\n".join(lines)
+
+    @classmethod
+    def from_history(cls, history: list):
+        instance = cls()
+        for move in history:
+            instance.drop_piece(move.get('column'))
+        return instance

@@ -28,7 +28,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../../'))
 # Suppress HTTP request logs for cleaner output
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-from backend.app.engine.ai import MODEL_PROVIDERS, ConnectFourAI
+from backend.app.engine.ai import ConnectFourAI
+from backend.app.core.model_registry import registry
 from backend.app.engine.game import ConnectFour
 
 # --- Configuration ---
@@ -103,7 +104,7 @@ async def main():
             return await test_model_generation(model_key)
 
     # Create tasks for all models
-    model_keys = sorted(MODEL_PROVIDERS.keys())
+    model_keys = sorted(registry.list_all().keys())
     tasks = [protected_test(model_key) for model_key in model_keys]
     
     results = {}
@@ -130,7 +131,8 @@ async def main():
         print("\n❌ Failed Models:")
         failed_models = [model for model, success in results.items() if not success]
         for model in failed_models:
-            provider = MODEL_PROVIDERS.get(model, {}).get('provider', 'unknown')
+            config = registry.get(model)
+            provider = config.provider if config else 'unknown'
             print(f"   • {model} [{provider}]")
         print(f"\n⚠️  {len(failed_models)} model(s) cannot generate valid structured outputs")
         print("   These models will fallback to random moves in actual gameplay.")

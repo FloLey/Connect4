@@ -6,177 +6,23 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from backend.app.core.model_registry import registry
+
 load_dotenv()
 
 # --- 1. Define Structured Output ---
 class MoveDecision(BaseModel):
     reasoning: str = Field(description="your reasoning that lead to the choice. step by step.")
     column: int = Field(description="Column index (0-6).")
-
-# Pricing is in USD per 1 Million Tokens
-MODEL_PROVIDERS = {
-    # --- OpenAI (Frontier) ---
-    "gpt-5.1": {
-        "provider": "openai", 
-        "label": "GPT-5.1", 
-        "context": 128000,
-        "pricing": {"input": 1.25, "output": 10.00}
-    },
-    "gpt-5-mini": {
-        "provider": "openai", 
-        "label": "GPT-5 Mini", 
-        "context": 128000,
-        "pricing": {"input": 0.25, "output": 2.00}
-    },
-    "gpt-5-nano": {
-        "provider": "openai", 
-        "label": "GPT-5 Nano", 
-        "context": 128000,
-        "pricing": {"input": 0.05, "output": 0.40}
-    },
-    "gpt-5": {
-        "provider": "openai", 
-        "label": "GPT-5", 
-        "context": 128000,
-        "pricing": {"input":1.25, "output": 10.00}
-    },
-    "gpt-4.1": {
-        "provider": "openai", 
-        "label": "GPT-4.1", 
-        "context": 128000,
-        "pricing": {"input": 2.00, "output": 8.00}
-    },
-    "gpt-4o": {
-        "provider": "openai", 
-        "label": "GPT-4o", 
-        "context": 128000,
-        "pricing": {"input": 2.50, "output": 10.00}
-    },
-
-    # --- Google (Gemini) ---
-    "gemini-3-pro-preview": {
-        "provider": "google", "label": "Gemini 3 Pro", "context": 1048576,
-        "pricing": {"input": 2.00, "output": 12.00}
-    },
-    "gemini-2.5-pro": {
-        "provider": "google", "label": "Gemini 2.5 Pro", "context": 1048576,
-        "pricing": {"input": 1.25, "output": 10.00}
-    },
-    "gemini-2.5-flash": {
-        "provider": "google", "label": "Gemini 2.5 Flash", "context": 1048576,
-        "pricing": {"input": 0.3, "output": 2.5}
-    },
-    "gemini-2.5-flash-lite": {
-        "provider": "google", "label": "Gemini 2.5 Flash-Lite", "context": 1048576,
-        "pricing": {"input": 0.1, "output": 0.4}
-    },
-
-    # --- Anthropic (Claude) ---
-    "claude-sonnet-4.5": {
-        "provider": "anthropic", 
-        "label": "Claude 4.5 Sonnet", 
-        "context": 200000,
-        "model_id": "claude-sonnet-4-5-20250929",
-        "pricing": {"input": 3.00, "output": 15.00}
-    },
-    "claude-opus-4.5": {
-        "provider": "anthropic", 
-        "label": "Claude 4.5 Opus", 
-        "context": 200000,
-        "model_id": "claude-opus-4-5-20251101",
-        "pricing": {"input": 15.00, "output": 75.00}
-    },
-    "claude-haiku-4.5": {
-        "provider": "anthropic", 
-        "label": "Claude 4.5 Haiku", 
-        "context": 200000,
-        "model_id": "claude-haiku-4-5-20251001",
-        "pricing": {"input": 0.25, "output": 1.25}
-    },
-
-    # --- DeepSeek ---
-    "deepseek-v3.2-chat": {
-        "provider": "deepseek",
-        "label": "DeepSeek V3.2 (Chat)",
-        "context": 128000,
-        "model_id": "deepseek-chat",
-        "api_config": {
-            "base_url": "https://api.deepseek.com"
-        },
-        "pricing": {"input": 0.14, "output": 0.28}  # Very cheap
-    },
-}
+    is_fallback: bool = Field(default=False, description="Whether this move was a system fallback due to AI failure.")
 
 def get_llm(model_key: str, temperature: float = 0.2):
     """
     Factory function to return the correct LangChain Chat Model.
+    Uses the new provider strategy pattern.
     """
-    # 1. Get Config
-    config = MODEL_PROVIDERS.get(model_key)
-    
-    # Auto-detection/Fallback for unknown models
-    if not config:
-        if "gpt" in model_key:
-            provider = "openai"
-        elif "claude" in model_key:
-            provider = "anthropic"
-        elif "gemini" in model_key:
-            provider = "google"
-        elif "deepseek" in model_key:
-            provider = "deepseek"
-        else:
-            print(f"Warning: Unknown model {model_key}, defaulting to gpt-4o")
-            provider = "openai"
-            model_key = "gpt-4o"
-        
-        # Create a dummy config for defaults
-        config = {"provider": provider, "model_id": model_key}
-    else:
-        provider = config["provider"]
-
-    # 2. Resolve Actual API Model ID
-    # Use 'model_id' if present (for overrides), otherwise use the dict key
-    api_model_name = config.get("model_id", model_key)
-    api_flags = config.get("api_config", {})
-
-    # 3. Instantiate Provider Class
-    if provider == "openai":
-        # Check for custom base_url (future proofing)
-        if api_flags.get("base_url"):
-            return ChatOpenAI(
-                model=api_model_name,
-                temperature=temperature,
-                base_url=api_flags.get("base_url")
-            )
-        else:
-            return ChatOpenAI(
-                model=api_model_name, 
-                temperature=temperature
-            )
-
-    elif provider == "anthropic":
-        return ChatAnthropic(
-            model=api_model_name, 
-            temperature=temperature
-        )
-
-    elif provider == "google":
-        return ChatGoogleGenerativeAI(
-            model=api_model_name,
-            temperature=temperature,
-            convert_system_message_to_human=True
-        )
-
-    elif provider == "deepseek":
-        return ChatOpenAI(
-            model=api_model_name,
-            temperature=temperature,
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url=api_flags.get("base_url", "https://api.deepseek.com")
-        )
-    
-    else:
-        raise ValueError(f"Unsupported provider: {provider}")
+    from backend.app.engine.ai_factory import get_llm as factory_get_llm
+    return factory_get_llm(model_key, temperature)
 
 # --- 3. Prompt Template ---
 SYSTEM_PROMPT = """
@@ -280,6 +126,17 @@ class ConnectFourAI:
 
         except Exception as e:
             print(f"AI Error ({self.model_name}): {e}")
+            err_msg = str(e).lower()
+            
+            # Check for Rate Limit signatures (Generic + Provider Specific)
+            is_rate_limit = any(x in err_msg for x in ["429", "rate_limit", "rate limit", "throttled", "quota exceeded", "too many requests"])
+            
+            if is_rate_limit:
+                # DO NOT play random move. Escalate to the Service Layer.
+                print(f"⚠️ Rate limit detected for {self.model_name}: {err_msg}")
+                raise e 
+            
+            # Fallback to random move ONLY for parsing/logic errors
             import random
             
             # Capture specific exception message and truncate if too long
@@ -294,7 +151,8 @@ class ConnectFourAI:
             
             fallback = MoveDecision(
                 reasoning=fallback_reasoning, 
-                column=random.choice(valid_moves)
+                column=random.choice(valid_moves),
+                is_fallback=True
             )
             return {
                 "decision": fallback,

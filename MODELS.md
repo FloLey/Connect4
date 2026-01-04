@@ -6,9 +6,10 @@ This document outlines the Large Language Models (LLMs) supported by the Connect
 
 We use a **Backend-Driven Architecture** for model management. 
 
-1.  **Master Config**: All models are defined in `backend/app/engine/ai.py`.
-2.  **API Exposure**: The backend exposes `GET /models`.
-3.  **Dynamic UI**: The Frontend (`NewGame.jsx`) fetches this list on load to populate the dropdowns. 
+1.  **Master Config**: All models are defined in `backend/config/models.yaml`.
+2.  **Model Registry**: Configuration is loaded via `backend/app/core/model_registry.py`.
+3.  **API Exposure**: The backend exposes `GET /models`.
+4.  **Dynamic UI**: The Frontend (`NewGame.jsx`) fetches this list on load to populate the dropdowns. 
 
 **🚫 Do not hardcode models in the Frontend.**
 
@@ -51,19 +52,25 @@ As of the latest configuration, the following models are registered in the backe
 
 To add a new model (e.g., `gpt-6` or `gemini-4`), you **only** need to touch the backend.
 
-1.  Open **`backend/app/engine/ai.py`**.
-2.  Locate the `MODEL_PROVIDERS` dictionary.
-3.  Add a new entry following this format:
+1.  Open **`backend/config/models.yaml`**.
+2.  Add a new entry in the `models` section following this format:
 
-```python
-"new-model-id": {
-    "provider": "openai",  # or "anthropic" or "google"
-    "label": "New Model Name",
-    "context": 128000
-},
+```yaml
+new-model-id:
+  provider: "openai"  # or "anthropic" or "google" or "deepseek"
+  label: "New Model Name"
+  context: 128000
+  pricing:
+    input: 1.25
+    output: 10.00
+  # Optional: model_id override if different from key
+  # model_id: "actual-api-model-name"
+  # Optional: API-specific configuration
+  # api_config:
+  #   base_url: "https://custom-api.example.com"
 ```
 
-4.  Restart the Backend container to apply changes:
+3.  Restart the Backend container to apply changes:
 
 ```bash
 docker compose restart backend

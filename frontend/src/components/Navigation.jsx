@@ -1,11 +1,13 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useTheme } from '../context/ThemeContext';
+import { useDatabase } from '../context/DatabaseContext';
 import { Sun, Moon, LayoutGrid, PlusCircle, History as HistoryIcon, Shield, BarChart2, Trophy } from 'lucide-react';
 
 const Navigation = () => {
   const location = useLocation();
   const { theme, toggleTheme } = useTheme();
+  const { dbEnv, toggleDb } = useDatabase();
 
   const isActive = (path) => location.pathname === path;
 
@@ -47,6 +49,19 @@ const Navigation = () => {
             <NavLink to="/admin" icon={Shield} label="Admin" />
           </div>
 
+          {/* Database Environment Toggle */}
+          <button
+            onClick={toggleDb}
+            className="px-3 py-1 rounded-full text-sm font-medium transition-colors focus:outline-none mr-2"
+            aria-label="Toggle Database Environment"
+            style={{
+              backgroundColor: dbEnv === 'prod' ? '#10B981' : '#F59E0B',
+              color: 'white'
+            }}
+          >
+            {dbEnv === 'prod' ? 'Production' : 'Test Sandbox'}
+          </button>
+          
           {/* Theme Toggle */}
           <button
             onClick={toggleTheme}

@@ -2,13 +2,20 @@ import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { getLeaderboard, getActiveGames } from '../api/client';
 import { Trophy, Activity, ArrowRight, Hash } from 'lucide-react';
+import { useDatabase } from '../context/DatabaseContext';
 
 const Dashboard = () => {
+  const { dbEnv } = useDatabase();
   const [leaderboard, setLeaderboard] = useState([]);
   const [activeGames, setActiveGames] = useState([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    setLoading(true);
+    // Optional: Clear data immediately for visual feedback
+    setLeaderboard([]);
+    setActiveGames([]);
+
     const fetchData = async () => {
       try {
         const [lbData, gamesData] = await Promise.all([
@@ -21,10 +28,11 @@ const Dashboard = () => {
         setLoading(false);
       }
     };
+
     fetchData();
     const interval = setInterval(fetchData, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [dbEnv]);
 
   const Card = ({ title, icon: Icon, children, className = "" }) => (
     <div className={`bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 shadow-sm overflow-hidden flex flex-col ${className}`}>

@@ -1,12 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 
 from backend.app.core.database import get_db
 from backend.app.services.tournament_service import tournament_service
 from backend.app.models.tournament_model import Tournament
+from backend.app.models.enums import GameStatus, TournamentStatus
 
 router = APIRouter()
 
@@ -15,10 +16,27 @@ class TournamentCreate(BaseModel):
     rounds: int = 1
     concurrency: int = 2
 
+class TournamentEvaluationCreate(BaseModel):
+    target_model: str = Field(..., description="The model being evaluated")
+    benchmark_models: List[str] = Field(..., description="List of models to play against")
+    rounds: int = Field(default=1, ge=1, le=20)
+    concurrency: int = Field(default=2, ge=1, le=100)
+
 @router.post("/create")
 async def create_tournament(payload: TournamentCreate, db: AsyncSession = Depends(get_db)):
     t = await tournament_service.create_tournament(
         db, payload.models, payload.rounds, payload.concurrency
+    )
+    return {"id": t.id, "total_matches": t.total_matches, "status": t.status}
+
+@router.post("/create-evaluation")
+async def create_evaluation_tournament(payload: TournamentEvaluationCreate, db: AsyncSession = Depends(get_db)):
+    t = await tournament_service.create_evaluation_tournament(
+        db, 
+        payload.target_model, 
+        payload.benchmark_models, 
+        payload.rounds, 
+        payload.concurrency
     )
     return {"id": t.id, "total_matches": t.total_matches, "status": t.status}
 
@@ -52,7 +70,7 @@ async def get_current_status(db: AsyncSession = Depends(get_db)):
     completed = await db.execute(
         select(func.count(Game.id)).where(
             Game.tournament_id == t.id, 
-            Game.status.in_(["COMPLETED", "DRAW"])
+            Game.status.in_([GameStatus.COMPLETED, GameStatus.DRAW])
         )
     )
     completed_count = completed.scalar() or 0
@@ -69,29 +87,36 @@ class TournamentConfigUpdate(BaseModel):
     concurrency: int
 
 @router.post("/{id}/pause")
-async def pause_tournament(id: int, db: AsyncSession = Depends(get_db)):
+async def pause_tournament(id: int, request: Request, db: AsyncSession = Depends(get_db)):
     """Pause a tournament - stops all running games but preserves state."""
-    success = await tournament_service.pause_tournament(db, id)
+    env = request.headers.get("x-db-env", "prod")
+    if env not in ["prod", "test"]:
+        env = "prod"
+    success = await tournament_service.pause_tournament(db, id, env)
     if not success:
         raise HTTPException(status_code=404, detail="Tournament not found")
     return {"message": "Tournament paused"}
 
 @router.post("/{id}/resume")
-async def resume_tournament(id: int, db: AsyncSession = Depends(get_db)):
+async def resume_tournament(id: int, request: Request, db: AsyncSession = Depends(get_db)):
     """Resume a paused tournament."""
+    env = request.headers.get("x-db-env", "prod")
+    if env not in ["prod", "test"]:
+        env = "prod"
+        
     result = await db.execute(select(Tournament).where(Tournament.id == id))
     t = result.scalar_one_or_none()
     if not t:
         raise HTTPException(status_code=404, detail="Tournament not found")
     
-    if t.status != "PAUSED":
+    if t.status != TournamentStatus.PAUSED:
         raise HTTPException(status_code=400, detail="Tournament is not paused")
     
-    t.status = "IN_PROGRESS"
+    t.status = TournamentStatus.IN_PROGRESS
     await db.commit()
     
     # Trigger tick to resume games
-    await tournament_service.tick(db)
+    await tournament_service.tick(db, env)
     
     return {"message": "Tournament resumed"}
 

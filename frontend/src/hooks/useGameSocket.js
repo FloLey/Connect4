@@ -1,8 +1,13 @@
 import { useEffect, useState, useRef } from 'react';
+import { useDatabase } from '../context/DatabaseContext';
 
-const WS_URL = 'ws://localhost:8000';
+const PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+const WS_URL = import.meta.env.VITE_API_URL 
+  ? import.meta.env.VITE_API_URL.replace('http', 'ws') 
+  : `${PROTOCOL}//${window.location.hostname}:8000`;
 
 export const useGameSocket = (gameId) => {
+  const { dbEnv } = useDatabase();
   const [gameState, setGameState] = useState(null);
   const [isThinking, setIsThinking] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
@@ -16,7 +21,11 @@ export const useGameSocket = (gameId) => {
     
     if (!gameId) return;
 
-    const ws = new WebSocket(`${WS_URL}/games/${gameId}/ws`);
+    // Retrieve token from local storage
+    const token = localStorage.getItem(`game_${gameId}_token`);
+    
+    // Add to WS URL
+    const ws = new WebSocket(`${WS_URL}/games/${gameId}/ws?env=${dbEnv}${token ? `&token=${token}` : ''}`);
     socketRef.current = ws;
 
     ws.onopen = () => {
@@ -51,7 +60,7 @@ export const useGameSocket = (gameId) => {
         socketRef.current.close();
       }
     };
-  }, [gameId]);
+  }, [gameId, dbEnv]);
 
   const sendMove = (colIndex) => {
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {

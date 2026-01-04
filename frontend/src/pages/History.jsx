@@ -2,8 +2,10 @@ import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { History as HistoryIcon, User, Cpu, Trophy, Play, Calendar, Hash, RefreshCw, Clock, Zap } from 'lucide-react';
 import { getGameHistory } from '../api/client';
+import { useDatabase } from '../context/DatabaseContext';
 
 const History = () => {
+  const { dbEnv } = useDatabase();
   const [games, setGames] = useState([]);
   const [loading, setLoading] = useState(true);
   const [currentPage, setCurrentPage] = useState(0);
@@ -12,9 +14,13 @@ const History = () => {
   const GAMES_PER_PAGE = 50;
 
   useEffect(() => {
-    // Initial load only
+    // Reset state to avoid showing "Prod" games while "Test" loads
+    setGames([]); 
+    setCurrentPage(0);
+    
+    // Reload
     loadGames(0, true);
-  }, []);
+  }, [dbEnv]);
 
   const loadGames = async (page, isReset) => {
     setLoading(true);

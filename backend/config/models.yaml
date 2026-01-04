@@ -1,0 +1,167 @@
+models:
+  # --- OpenAI (Frontier) ---
+  gpt-5.1:
+    provider: "openai"
+    label: "GPT-5.1"
+    context: 128000
+    pricing:
+      input: 1.25
+      output: 10.00
+  
+  gpt-5.2:
+    provider: "openai"
+    label: "GPT-5.2"
+    context: 128000
+    pricing:
+      input: 1.75
+      cached_input: 0.175
+      output: 14.00
+  
+  gpt-5-mini:
+    provider: "openai"
+    label: "GPT-5 Mini"
+    context: 128000
+    pricing:
+      input: 0.25
+      output: 2.00
+  
+  gpt-5-nano:
+    provider: "openai"
+    label: "GPT-5 Nano"
+    context: 128000
+    pricing:
+      input: 0.05
+      output: 0.40
+  
+  gpt-5:
+    provider: "openai"
+    label: "GPT-5"
+    context: 128000
+    pricing:
+      input: 1.25
+      output: 10.00
+  
+  gpt-4.1:
+    provider: "openai"
+    label: "GPT-4.1"
+    context: 128000
+    pricing:
+      input: 2.00
+      output: 8.00
+  
+  gpt-4o:
+    provider: "openai"
+    label: "GPT-4o"
+    context: 128000
+    pricing:
+      input: 2.50
+      output: 10.00
+
+  # --- Google (Gemini) ---
+  gemini-3-pro-preview:
+    provider: "google"
+    label: "Gemini 3 Pro"
+    context: 1048576
+    pricing:
+      input: 2.00
+      output: 12.00
+  
+  gemini-2.5-pro:
+    provider: "google"
+    label: "Gemini 2.5 Pro"
+    context: 1048576
+    pricing:
+      input: 1.25
+      output: 10.00
+  
+  gemini-2.5-flash:
+    provider: "google"
+    label: "Gemini 2.5 Flash"
+    context: 1048576
+    pricing:
+      input: 0.3
+      output: 2.5
+  
+  gemini-2.5-flash-lite:
+    provider: "google"
+    label: "Gemini 2.5 Flash-Lite"
+    context: 1048576
+    pricing:
+      input: 0.1
+      output: 0.4
+
+  gemini-3-flash-preview:
+    provider: "google"
+    label: "Gemini 3 Flash Preview"
+    context: 1048576
+    pricing:
+      input: 0.0  # Free for text/image/video
+      output: 3.00
+
+  # --- Anthropic (Claude) ---
+  claude-sonnet-4.5:
+    provider: "anthropic"
+    label: "Claude 4.5 Sonnet"
+    context: 200000
+    model_id: "claude-sonnet-4-5-20250929"
+    pricing:
+      input: 3.00
+      output: 15.00
+  
+  claude-opus-4.5:
+    provider: "anthropic"
+    label: "Claude 4.5 Opus"
+    context: 200000
+    model_id: "claude-opus-4-5-20251101"
+    pricing:
+      input: 15.00
+      output: 75.00
+  
+  claude-haiku-4.5:
+    provider: "anthropic"
+    label: "Claude 4.5 Haiku"
+    context: 200000
+    model_id: "claude-haiku-4-5-20251001"
+    pricing:
+      input: 0.25
+      output: 1.25
+
+  # --- DeepSeek ---
+  deepseek-v3.2-chat:
+    provider: "deepseek"
+    label: "DeepSeek V3.2 (Chat)"
+    context: 128000
+    model_id: "deepseek-chat"
+    api_config:
+      base_url: "https://api.deepseek.com"
+    pricing:
+      input: 0.14
+      output: 0.28
+
+  # --- Mistral AI ---
+  mistral-large-3:
+    provider: "mistral"
+    label: "Mistral Large 3"
+    context: 128000
+    model_id: "mistral-large-latest"
+    pricing:
+      input: 0.50
+      output: 1.50
+
+  mistral-medium-3:
+    provider: "mistral"
+    label: "Mistral Medium 3"
+    context: 32000
+    model_id: "mistral-medium-latest"
+    pricing:
+      input: 0.40
+      output: 2.00
+
+  ministral-3-14b:
+    provider: "mistral"
+    label: "Ministral 3 (14B)"
+    context: 128000
+    model_id: "ministral-8b-latest"
+    pricing:
+      input: 0.20
+      output: 0.20

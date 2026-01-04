@@ -50,6 +50,11 @@ export const getHistory = async (modelName) => {
   return response.data;
 };
 
+export const getHistoryPlot = async () => {
+  const response = await apiClient.get('/stats/history-plot');
+  return response.data;
+};
+
 // Admin API functions
 export const getAdminStatus = async () => {
   const response = await apiClient.get('/admin/status');
@@ -113,6 +118,16 @@ export const resumeTournament = async (tournamentId) => {
 
 export const updateTournamentConfig = async (tournamentId, concurrency) => {
   const response = await apiClient.patch(`/tournament/${tournamentId}/config`, {
+    concurrency
+  });
+  return response.data;
+};
+
+export const createEvaluationTournament = async (target, benchmarks, rounds, concurrency) => {
+  const response = await apiClient.post('/tournament/create-evaluation', {
+    target_model: target,
+    benchmark_models: benchmarks,
+    rounds,
     concurrency
   });
   return response.data;

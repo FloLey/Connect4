@@ -1,186 +1,213 @@
 # Connect Four LLM Arena 🎯
 
-A full-stack web platform to benchmark Large Language Models (LLMs) on the game of Connect Four.
+A production-grade competitive platform to benchmark Large Language Models (LLMs) against humans and each other.
 
-## Features
+The platform orchestrates tournaments, calculates ELO ratings, tracks token usage/costs, and provides deep analytics on model reasoning capabilities using the game of Connect Four.
 
-- **Live Arena**: Human vs AI real-time gameplay
-- **Replay System**: "Time-travel" through past games with LLM reasoning
-- **Automated Tournament**: Background AI vs AI matches for ELO ratings
+![Status](https://img.shields.io/badge/Status-Production%20Ready-green)
+![Stack](https://img.shields.io/badge/Stack-FastAPI%20%7C%20React%20%7C%20PostgreSQL-blue)
+![Docker](https://img.shields.io/badge/Docker-Supported-2496ED)
 
-## Tech Stack
+## 🌟 Key Features
 
-- **Backend**: Python 3.11+ (FastAPI)
-- **Real-Time**: WebSockets (Native FastAPI)
-- **Database**: PostgreSQL (SQLAlchemy + Alembic)
-- **AI Orchestration**: LangChain with Pydantic JSON outputs
-- **Frontend**: React (Vite) + Tailwind CSS
-- **Containerization**: Docker & Docker Compose
+### 🏟️ The Arena
+*   **Human vs. AI:** Real-time gameplay via WebSockets.
+*   **AI vs. AI:** Spectate live matches between different models.
+*   **Unified Replay System:** "Time-travel" through past games with a scrubber timeline.
+*   **Reasoning Visibility:** View the raw "Chain of Thought" and token cost for every AI move.
 
-## Project Structure
+### 🏆 Tournament System
+*   **Automated Benchmarking:** Run background round-robin tournaments.
+*   **Concurrency Control:** Adjust the number of parallel workers live without restarting the server.
+*   **Resiliency:** System automatically resumes interrupted tournaments/games on startup.
+*   **ELO Engine:** Real-time rating updates ($K=32$) with idempotency checks.
+
+### 📊 Analytics & Economics
+*   **Live Leaderboard:** Track Win Rates, ELO, and Games Played.
+*   **Economic Analysis:** Scatter plots for Cost vs. Performance and Speed vs. Performance.
+*   **Win Rate Matrix:** Heatmap detection of model-specific weaknesses.
+*   **Multi-Provider Support:** First-class support for OpenAI, Anthropic, Google Gemini, and DeepSeek.
+
+### 🛠️ Architecture
+*   **Dual-Environment:** Instant toggle between `Production` (Ranked) and `Test` (Sandbox) databases via the UI.
+*   **Row-Level Locking:** Prevents race conditions during simultaneous moves.
+*   **Hybrid Architecture:** WebSockets for live interactions; Async Background Runners for tournament execution.
+
+---
+
+## 🏗 Tech Stack
+
+### Backend
+*   **Framework:** Python 3.11, FastAPI
+*   **Database:** PostgreSQL (AsyncSQLAlchemy + Alembic)
+*   **AI Orchestration:** LangChain (Structured Output / Function Calling)
+*   **Tasks:** AsyncIO Native Background Tasks
+
+### Frontend
+*   **Framework:** React 18 (Vite)
+*   **Styling:** Tailwind CSS (Dark Mode supported)
+*   **Visualization:** Recharts (Analytics), Framer Motion (Animations)
+*   **State:** Context API
+
+---
+
+## 🚀 Getting Started (Docker)
+
+The preferred way to run the application is via Docker Compose.
+
+### 1. Prerequisites
+*   Docker & Docker Compose
+*   API Keys for desired providers (OpenAI, Anthropic, Google, etc.)
+
+### 2. Configuration
+Copy the example environment file:
+```bash
+cp backend/.env.example backend/.env
+```
+Edit `backend/.env` and add your API keys:
+```ini
+DATABASE_URL=postgresql+asyncpg://user:password@db:5432/connect4_arena
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant...
+# Add other keys as needed
+```
+
+### 3. Run the Stack
+```bash
+docker compose up --build
+```
+*   **Frontend:** http://localhost:5173
+*   **Backend API:** http://localhost:8000
+*   **Docs:** http://localhost:8000/docs
+
+**Note:** The `init_db.py` script runs automatically on container start to create tables in both Production and Test databases.
+
+---
+
+## 🛠️ Management & Scripts
+
+All scripts should be run from the project root inside the backend container.
+
+### Verify Model Configuration
+Before starting a tournament, verify your API keys and model availability:
+```bash
+docker compose exec backend python backend/scripts/verify_ai_moves.py
+```
+Runs a parallelized check against all configured LLMs to ensure they can produce valid JSON game moves.
+
+### Database Cleanup
+To archive abandoned games (older than 1 hour):
+```bash
+docker compose exec backend python backend/scripts/cleanup_games.py
+```
+
+### Database Snapshot
+Create a SQL dump of the current database state:
+```bash
+./backend/scripts/snapshot_db.sh
+```
+
+---
+
+## 🧠 Adding New Models
+
+Model configurations are centrally managed in the backend via YAML configuration.
+
+1.  Open `backend/config/models.yaml`.
+2.  Add a new entry to the `models` section.
+3.  Restart the backend container.
+
+See `MODELS.md` for detailed configuration options and currently supported models.
+
+---
+
+## 🧪 Development Workflow
+
+### Hot Reloading
+Both Frontend and Backend containers are configured for Hot Reloading.
+
+*   **Backend:** Changes to `*.py` files trigger a Uvicorn reload.
+*   **Frontend:** Changes to `*.jsx` trigger a Vite HMR update.
+
+### Test Environment
+Use the toggle in the Top Navigation Bar to switch between **Production** and **Test Sandbox**.
+
+*   **Production:** Affects the main leaderboard.
+*   **Test:** Isolated database for testing new models or features without affecting stats.
+
+**Note:** API costs are real in both environments.
+
+---
+
+## 📂 Project Structure
 
 ```
-connect4-llm-arena/
-├── backend/                    # Python / FastAPI
+Connect4/
+├── backend/
 │   ├── app/
-│   │   ├── api/               # Route Handlers
-│   │   │   └── websocket_manager.py
-│   │   ├── core/              # Config
-│   │   │   ├── config.py
-│   │   │   └── database.py
-│   │   ├── engine/            # Pure Game Logic
-│   │   │   ├── game.py        # ConnectFour rules
-│   │   │   └── ai.py          # LangChain Agent
-│   │   ├── models/            # Database Models
-│   │   │   └── game_model.py
-│   │   ├── schemas/           # Pydantic Schemas
-│   │   │   └── game_schema.py
-│   │   └── main.py            # FastAPI app
-│   ├── migrations/            # Alembic (DB Migrations)
-│   ├── requirements.txt
-│   └── scripts/
-│       └── init_db.py         # Database initialization
-├── frontend/                  # React (Vite)
-│   └── src/
-│       ├── api/              # Axios wrappers
-│       ├── components/       # Reusable UI
-│       ├── hooks/           # useGameSocket.js
-│       └── pages/           # Arena, Gallery, Replay
-├── docker-compose.yml        # Postgres orchestration
-└── README.md
+│   │   ├── api/            # Endpoints (Games, Stats, Admin)
+│   │   ├── engine/         # Core Logic (Connect4, AI, ELO)
+│   │   ├── services/       # Business Logic (Tournament, Runner)
+│   │   └── models/         # DB Models
+│   ├── scripts/            # Utility Scripts
+│   └── main.py             # Entry Point & Lifespan Manager
+├── frontend/
+│   ├── src/
+│   │   ├── components/     # Reusable UI
+│   │   ├── context/        # Theme & DB Context
+│   │   └── pages/          # Views (Arena, Dashboard, Stats)
+└── docker-compose.yml
 ```
 
-## Getting Started
+---
 
-### Prerequisites
+## 📈 API Endpoints
 
-- Python 3.11+
-- PostgreSQL
-- OpenAI API key
+### Core Game API
+*   `POST /games` - Create a new game
+*   `GET /games/{id}` - Get game details and history
+*   `GET /games/history` - Paginated game history
+*   `WebSocket /games/{id}/ws` - Real-time gameplay
 
-### Installation
+### Statistics & Analytics
+*   `GET /stats/leaderboard` - Model performance rankings
+*   `GET /stats/matrix` - Win rate matrix (model vs model)
+*   `GET /stats/history` - ELO progression over time
+*   `GET /stats/active-games` - Live tournament matches
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd Connect4
-   ```
+### Tournament Management
+*   `POST /tournament/create` - Create a new tournament
+*   `GET /tournament/current` - Get active tournament status
+*   `POST /tournament/{id}/start` - Start tournament execution
+*   `POST /tournament/{id}/pause` - Pause tournament (adjust concurrency)
+*   `POST /tournament/{id}/resume` - Resume paused tournament
+*   `POST /tournament/{id}/stop` - Gracefully stop tournament
 
-2. **Set up Python environment**
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   pip install -r backend/requirements.txt
-   ```
+### Administration
+*   `GET /admin/status` - System health and queue status
+*   `DELETE /admin/reset` - **DANGER** - Reset entire database (requires confirmation)
 
-3. **Set up PostgreSQL**
-   ```bash
-   # Install PostgreSQL (Ubuntu/Debian)
-   sudo apt-get update
-   sudo apt-get install -y postgresql postgresql-contrib
-   
-   # Start PostgreSQL service
-   sudo service postgresql start
-   
-   # Create database and user
-   sudo -u postgres psql -c "CREATE DATABASE connect4_arena;"
-   sudo -u postgres psql -c "CREATE USER connect4_user WITH PASSWORD 'connect4';"
-   sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE connect4_arena TO connect4_user;"
-   sudo -u postgres psql -c "ALTER USER connect4_user WITH SUPERUSER;"
-   ```
+---
 
-4. **Configure environment variables**
-   ```bash
-   # Copy .env.example to .env and update values
-   cp backend/.env.example backend/.env
-   # Edit backend/.env with your OpenAI API key
-   ```
+## 🔒 Race Condition Prevention
 
-5. **Initialize database**
-   ```bash
-   python -m backend.scripts.init_db
-   ```
+The system implements robust race condition prevention:
 
-### Running the Application
+1.  **Row-Level Locking:** Database `FOR UPDATE` locks prevent simultaneous moves
+2.  **Move Count Validation:** AI moves validate `len(history)` before committing
+3.  **Idempotent ELO Updates:** ELO calculations include game ID to prevent double-counting
+4.  **Background Runner Isolation:** Tournament games run in isolated processes
 
-1. **Start the backend server**
-   ```bash
-   uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
-   ```
+---
 
-2. **API will be available at**: http://localhost:8000
-   - API documentation: http://localhost:8000/docs
-   - WebSocket endpoint: ws://localhost:8000/games/{id}/ws
-
-### API Endpoints
-
-- `POST /games` - Create a new game
-- `GET /games/{id}` - Get game details and history
-- `GET /games` - List completed games (for leaderboard)
-- `WebSocket /games/{id}/ws` - Real-time gameplay
-
-### WebSocket Protocol
-
-**Connection**: `ws://localhost:8000/games/{game_id}/ws`
-
-**Client → Server** (Human move):
-```json
-{ "action": "MOVE", "column": 3 }
-```
-
-**Server → Client** messages:
-- `{"type": "UPDATE", "board_visual": "...", "current_turn": 1, ...}` - Game state update
-- `{"type": "THINKING_START"}` - AI is thinking
-- `{"type": "THINKING_END"}` - AI finished thinking
-
-## Development Status
-
-### ✅ Phase 1: Core Engine (Completed)
-- ConnectFour game logic
-- LangChain AI agent with structured outputs
-- CLI testing script (`console_test.py`)
-
-### ✅ Phase 2: Backend & Database (Completed)
-- PostgreSQL database setup
-- FastAPI REST endpoints
-- WebSocket real-time game loop
-- Game state persistence
-
-### 🔄 Phase 3: Frontend (Next)
-- React board component
-- WebSocket hook integration
-- Replay view with slider
-- AI reasoning display
-
-### 📋 Phase 4: Tournament System
-- Automated AI vs AI matches
-- ELO rating calculation
-- Background tournament runner
-
-## Testing
-
-Run the console test:
-```bash
-python console_test.py
-```
-
-Test the API:
-```bash
-# Create a game
-curl -X POST "http://localhost:8000/games" \
-  -H "Content-Type: application/json" \
-  -d '{"player_1": "human", "player_2": "ai"}'
-
-# Get game details
-curl "http://localhost:8000/games/1"
-```
-
-## License
+## 📝 License
 
 MIT
 
-## Acknowledgments
+---
 
-- Built with FastAPI, React, and LangChain
-- Inspired by AI benchmarking challenges
-- Connect Four game logic implementation
+## 🙏 Acknowledgments
+
+*   Built with FastAPI, React, and LangChain
+*   Inspired by AI benchmarking challenges
+*   Connect Four game logic implementation

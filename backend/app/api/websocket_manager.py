@@ -15,7 +15,8 @@ from fastapi import WebSocket
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.services.game_service import game_service, GameState
-from backend.app.core.database import AsyncSessionLocal
+from backend.app.core.database import get_session_maker
+from backend.app.models.enums import GameStatus, PlayerType
 
 
 class ConnectionManager:
@@ -53,24 +54,30 @@ class ConnectionManager:
                     # Remove dead connections
                     pass
 
-    async def handle_game_session(self, websocket: WebSocket, game_id: int, db: AsyncSession):
+    async def handle_game_session(self, websocket: WebSocket, game_id: int):
         """Handle WebSocket connection for a game session - PASSIVE MODE"""
-        await self.connect(websocket, game_id)
+        # 1. Read Query Params
+        env = websocket.query_params.get("env", "prod")
+        player_token = websocket.query_params.get("token", None)
         
+        await self.connect(websocket, game_id)
+        SessionLocal = get_session_maker(env)
+
         try:
             # Send initial game state
-            try:
-                game_db, engine = await game_service.get_game_state(db, game_id)
-                current_state = GameState(game_db, engine)
-                await websocket.send_json(self._build_state_message(current_state))
-                
-                # RECOVERY: Check if AI should play after reconnection (for stuck games)
-                if game_db.status == "IN_PROGRESS" and not current_state.winner and not current_state.is_draw:
-                    await self._check_and_trigger_ai_for_human_vs_ai(game_id, current_state)
+            async with SessionLocal() as db:
+                try:
+                    game_db, engine = await game_service.get_game_state(db, game_id)
+                    current_state = GameState(game_db, engine)
+                    await websocket.send_json(self._build_state_message(current_state))
                     
-            except ValueError as e:
-                await websocket.close(code=4004)  # Game not found
-                return
+                    # RECOVERY: Check if AI should play after reconnection (for stuck games)
+                    if game_db.status == GameStatus.IN_PROGRESS and not current_state.winner and not current_state.is_draw:
+                        await self._check_and_trigger_ai_for_human_vs_ai(game_id, current_state, env)
+                        
+                except ValueError as e:
+                    await websocket.close(code=4004)  # Game not found
+                    return
 
             # Listen for human moves only
             while True:
@@ -78,7 +85,7 @@ class ConnectionManager:
                 payload = json.loads(data)
                 
                 if payload.get("action") == "MOVE":
-                    await self._handle_human_move(game_id, payload["column"])
+                    await self._handle_human_move(game_id, payload["column"], player_token, env)
 
         except Exception as e:
             # Silently handle disconnects
@@ -86,12 +93,13 @@ class ConnectionManager:
         finally:
             self.disconnect(websocket, game_id)
 
-    async def _handle_human_move(self, game_id: int, column: int):
+    async def _handle_human_move(self, game_id: int, column: int, player_token: str = None, env: str = "prod"):
         """Process a human move and trigger AI response if needed (Human vs AI games)"""
-        async with AsyncSessionLocal() as db:
+        SessionLocal = get_session_maker(env)
+        async with SessionLocal() as db:
             try:
-                # Process human move
-                state = await game_service.process_human_move(db, game_id, column)
+                # Let the service handle validation inside the lock
+                state = await game_service.process_human_move(db, game_id, column, player_token)
                 
                 # Broadcast the updated state
                 await self.broadcast(game_id, self._build_state_message(state))
@@ -99,7 +107,7 @@ class ConnectionManager:
                 # Check if we should trigger AI for Human vs AI games
                 # (Background Game Runner handles AI vs AI games)
                 if not state.winner and not state.is_draw:
-                    await self._check_and_trigger_ai_for_human_vs_ai(game_id, state)
+                    await self._check_and_trigger_ai_for_human_vs_ai(game_id, state, env)
                     
             except ValueError as e:
                 # Invalid move - could send error message to client
@@ -107,7 +115,7 @@ class ConnectionManager:
             except Exception as e:
                 print(f"Error processing human move: {e}")
 
-    async def _check_and_trigger_ai_for_human_vs_ai(self, game_id: int, current_state: GameState):
+    async def _check_and_trigger_ai_for_human_vs_ai(self, game_id: int, current_state: GameState, env: str = "prod"):
         """Check if AI should play next and trigger it (ONLY for Human vs AI games)"""
         # Determine if current turn is AI
         current_ai_model = (current_state.player_1_type if current_state.current_turn == 1 
@@ -117,15 +125,15 @@ class ConnectionManager:
         # 1. Current turn is AI (not human)
         # 2. This is NOT an AI vs AI game (Background Game Runner handles those)
         is_human_vs_ai = (
-            (current_state.player_1_type == "human" and current_state.player_2_type != "human") or
-            (current_state.player_1_type != "human" and current_state.player_2_type == "human")
+            (current_state.player_1_type == PlayerType.HUMAN and current_state.player_2_type != PlayerType.HUMAN) or
+            (current_state.player_1_type != PlayerType.HUMAN and current_state.player_2_type == PlayerType.HUMAN)
         )
         
-        if current_ai_model != "human" and is_human_vs_ai and not current_state.winner and not current_state.is_draw:
+        if current_ai_model != PlayerType.HUMAN and is_human_vs_ai and not current_state.winner and not current_state.is_draw:
             # Trigger AI turn for Human vs AI games only
-            asyncio.create_task(self._execute_ai_turn_for_human_vs_ai(game_id))
+            asyncio.create_task(self._execute_ai_turn_for_human_vs_ai(game_id, env))
 
-    async def _execute_ai_turn_for_human_vs_ai(self, game_id: int):
+    async def _execute_ai_turn_for_human_vs_ai(self, game_id: int, env: str = "prod"):
         """Execute AI turn for Human vs AI games with proper locking"""
         # 1. LOCK CHECK (prevent double AI turns)
         if game_id in self.processing_game_ids:
@@ -137,7 +145,8 @@ class ConnectionManager:
             await self.broadcast(game_id, {"type": "THINKING_START"})
             
             # 2. PERFORM AI LOGIC
-            async with AsyncSessionLocal() as db:
+            SessionLocal = get_session_maker(env)
+            async with SessionLocal() as db:
                 new_state = await game_service.step_ai_turn(db, game_id)
                 
                 if new_state:

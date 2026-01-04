@@ -2,8 +2,13 @@ import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useGameSocket } from '../hooks/useGameSocket';
 import GameBoard from '../components/GameBoard';
+import PlayerCard from '../components/arena/PlayerCard';
+import ReplayControls from '../components/arena/ReplayControls';
+import ReasoningPanel from '../components/arena/ReasoningPanel';
+import GameStatusBadge from '../components/arena/GameStatusBadge';
+import { GAME_STATUS, PLAYER_TYPE } from '../constants';
 import { getGame, getPendingHumanGames } from '../api/client';
-import { Brain, Cpu, User, Play, Pause, SkipBack, SkipForward, Eye, AlertCircle, ChevronLeft, ChevronRight, Gamepad2 } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Gamepad2 } from 'lucide-react';
 
 const Arena = () => {
   const { id } = useParams();
@@ -21,7 +26,7 @@ const Arena = () => {
     getGame(gameId).then((game) => {
       setMeta(game);
       // If game is completed, enter replay mode
-      if (game.status === 'COMPLETED' || game.status === 'DRAW') {
+      if (game.status === GAME_STATUS.COMPLETED || game.status === GAME_STATUS.DRAW) {
         setReplayStep(game.history ? game.history.length - 1 : 0);
       }
     }).catch(console.error);
@@ -29,7 +34,7 @@ const Arena = () => {
 
   // NEW: Watch for Live Game Completion to trigger Replay Mode
   useEffect(() => {
-    if (gameState && (gameState.status === 'COMPLETED' || gameState.status === 'DRAW')) {
+    if (gameState && (gameState.status === GAME_STATUS.COMPLETED || gameState.status === GAME_STATUS.DRAW)) {
       // Game just finished live. Fetch full history to enable replay.
       getGame(gameId).then((fullGame) => {
         setMeta(fullGame); // This updates status and populates history
@@ -117,8 +122,8 @@ const Arena = () => {
     return board;
   };
 
-  const isSpectatorMode = meta?.player_1_type !== 'human' && meta?.player_2_type !== 'human';
-  const isReplayMode = meta?.status === 'COMPLETED' || meta?.status === 'DRAW';
+  const isSpectatorMode = meta?.player_1_type !== PLAYER_TYPE.HUMAN && meta?.player_2_type !== PLAYER_TYPE.HUMAN;
+  const isReplayMode = meta?.status === GAME_STATUS.COMPLETED || meta?.status === GAME_STATUS.DRAW;
   const isLiveMode = !isReplayMode && isConnected;
 
   const handleColumnClick = (colIndex) => {
@@ -208,41 +213,31 @@ const Arena = () => {
             <h2 className="text-lg font-bold text-gray-900 dark:text-white">Match #{gameId}</h2>
             <div className="flex gap-2">
               {isSpectatorMode && isLiveMode && (
-                <span className="px-2 py-1 rounded-md text-xs font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 flex items-center gap-1">
-                  <Eye size={12} /> Spectating
-                </span>
+                <GameStatusBadge type="spectating" />
               )}
               {isReplayMode && (
-                <span className="px-2 py-1 rounded-md text-xs font-medium bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">
-                  Replay
-                </span>
+                <GameStatusBadge type="replay" />
               )}
               {isLiveMode && (
-                <span className={`px-2 py-1 rounded-md text-xs font-medium ${isConnected ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300' : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'}`}>
-                  {isConnected ? 'LIVE' : 'OFFLINE'}
-                </span>
+                <GameStatusBadge type="live" isConnected={isConnected} />
               )}
             </div>
           </div>
 
           {/* Players */}
           <div className="space-y-3">
-            <div className={`p-4 rounded-lg border transition-all ${currentTurn === 1 ? 'bg-red-50 border-red-200 dark:bg-red-900/10 dark:border-red-900/50 shadow-sm' : 'bg-gray-50 border-gray-100 dark:bg-gray-800 dark:border-gray-700 opacity-60'}`}>
-              <div className="flex items-center gap-3">
-                <div className="w-3 h-3 rounded-full bg-red-500 shadow-sm"></div>
-                <div className="font-medium text-gray-900 dark:text-white flex items-center gap-2">
-                  {p1Name === 'human' ? <User size={16}/> : <Cpu size={16}/>} {p1Name}
-                </div>
-              </div>
-            </div>
-            <div className={`p-4 rounded-lg border transition-all ${currentTurn === 2 ? 'bg-yellow-50 border-yellow-200 dark:bg-yellow-900/10 dark:border-yellow-900/50 shadow-sm' : 'bg-gray-50 border-gray-100 dark:bg-gray-800 dark:border-gray-700 opacity-60'}`}>
-              <div className="flex items-center gap-3">
-                <div className="w-3 h-3 rounded-full bg-yellow-400 shadow-sm"></div>
-                <div className="font-medium text-gray-900 dark:text-white flex items-center gap-2">
-                  {p2Name === 'human' ? <User size={16}/> : <Cpu size={16}/>} {p2Name}
-                </div>
-              </div>
-            </div>
+            <PlayerCard 
+              name={p1Name} 
+              type={p1Name === PLAYER_TYPE.HUMAN ? PLAYER_TYPE.HUMAN : PLAYER_TYPE.AI} 
+              isActive={currentTurn === 1} 
+              color="red" 
+            />
+            <PlayerCard 
+              name={p2Name} 
+              type={p2Name === PLAYER_TYPE.HUMAN ? PLAYER_TYPE.HUMAN : PLAYER_TYPE.AI} 
+              isActive={currentTurn === 2} 
+              color="yellow" 
+            />
           </div>
 
           <div className="mt-6 pt-6 border-t border-gray-100 dark:border-gray-800 text-center">
@@ -260,65 +255,22 @@ const Arena = () => {
 
         {/* AI Reasoning Card */}
         {lastMove?.reasoning && (
-          <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-6 shadow-sm flex flex-col h-[300px]">
-            <div className="flex items-center gap-2 mb-4 text-brand-600 dark:text-brand-400">
-              <Brain size={20} /><h3 className="font-bold">AI Thought Process</h3>
-            </div>
-            
-            <div className={`flex-1 p-4 rounded-lg text-sm leading-relaxed border overflow-y-auto ${
-              lastMove.reasoning.startsWith('⚠️') 
-                ? 'bg-red-50 border-red-100 text-red-700 dark:bg-red-900/20 dark:border-red-900/50 dark:text-red-300' 
-                : 'bg-gray-50 border-gray-100 text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-300'
-            }`}>
-              <p className="whitespace-pre-wrap">{lastMove.reasoning}</p>
-            </div>
-            
-            <div className="mt-3 text-right text-xs text-gray-400 font-mono">
-              Tokens: {lastMove.input_tokens || 0} in / {lastMove.output_tokens || 0} out
-            </div>
-          </div>
+          <ReasoningPanel 
+            reasoning={lastMove.reasoning}
+            inputTokens={lastMove.input_tokens || 0}
+            outputTokens={lastMove.output_tokens || 0}
+          />
         )}
 
         {/* Replay Controls */}
         {isReplayMode && meta?.history && (
-          <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-6 shadow-sm">
-            <div className="flex items-center gap-2 mb-4 text-purple-600 dark:text-purple-400">
-              <Play size={20} />
-              <h3 className="font-bold">Replay Controls</h3>
-            </div>
-            
-            <div className="space-y-6">
-              <div className="flex items-center justify-center gap-4">
-                <button onClick={() => setReplayStep(0)} disabled={replayStep === 0} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-full transition disabled:opacity-30">
-                  <SkipBack size={20} className="text-gray-600 dark:text-gray-300" />
-                </button>
-                
-                <button onClick={() => setIsPlaying(!isPlaying)} disabled={replayStep >= meta.history.length - 1} className="p-4 bg-purple-600 hover:bg-purple-700 text-white rounded-full shadow-md transition disabled:opacity-50 disabled:cursor-not-allowed">
-                  {isPlaying ? <Pause size={24} /> : <Play size={24} className="ml-1" />}
-                </button>
-                
-                <button onClick={() => setReplayStep(meta.history.length - 1)} disabled={replayStep >= meta.history.length - 1} className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-full transition disabled:opacity-30">
-                  <SkipForward size={20} className="text-gray-600 dark:text-gray-300" />
-                </button>
-              </div>
-              
-              <div className="space-y-2">
-                <input
-                  type="range"
-                  min="0"
-                  max={meta.history.length - 1}
-                  value={replayStep}
-                  onChange={(e) => setReplayStep(parseInt(e.target.value))}
-                  className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-lg appearance-none cursor-pointer accent-purple-600"
-                />
-                <div className="flex justify-between text-xs text-gray-500 font-medium">
-                  <span>Start</span>
-                  <span>Move {replayStep + 1} / {meta.history.length}</span>
-                  <span>End</span>
-                </div>
-              </div>
-            </div>
-          </div>
+          <ReplayControls 
+            step={replayStep}
+            total={meta.history.length}
+            isPlaying={isPlaying}
+            onSeek={setReplayStep}
+            onPlayPause={() => setIsPlaying(!isPlaying)}
+          />
         )}
       </div>
 
@@ -335,13 +287,18 @@ const Arena = () => {
            )}
            
            {displayBoard ? (
-             <GameBoard 
-                board={displayBoard} 
-                onColumnClick={handleColumnClick} 
-                currentTurn={currentTurn} 
-                isHumanTurn={!isSpectatorMode && !isReplayMode} 
-                winner={winner} 
-             />
+             <div className={`relative ${isThinking && isLiveMode ? 'cursor-wait' : ''}`}>
+               {isThinking && isLiveMode && (
+                 <div className="absolute inset-0 z-30 bg-white/10 dark:bg-gray-900/10 backdrop-blur-[1px]" /> // Invisible click blocker
+               )}
+               <GameBoard 
+                  board={displayBoard} 
+                  onColumnClick={handleColumnClick} 
+                  currentTurn={currentTurn} 
+                  isHumanTurn={!isSpectatorMode && !isReplayMode && !isThinking} // Disable here too
+                  winner={winner} 
+               />
+             </div>
            ) : (
              <div className="text-gray-400 flex flex-col items-center gap-3">
                 <div className="w-8 h-8 border-4 border-gray-300 border-t-brand-600 rounded-full animate-spin"></div>

@@ -1,22 +1,26 @@
 import React, { useState, useEffect, useRef } from 'react'; // <--- Added useRef
 import { 
   Trophy, Play, Square, Settings, 
-  Cpu, Activity, CheckCircle2, AlertCircle, RefreshCw, ArrowRight as ArrowIcon
+  Cpu, Activity, CheckCircle2, AlertCircle, RefreshCw, Clock, ArrowRight as ArrowIcon
 } from 'lucide-react';
 import { 
-  getModels, createTournament, startTournament, 
+  getModels, createTournament, createEvaluationTournament, startTournament, 
   stopTournament, getCurrentTournament, getActiveGames,
   pauseTournament, resumeTournament, updateTournamentConfig 
 } from '../api/client';
 import { Link } from 'react-router-dom';
 import MiniGameBoard from '../components/MiniGameBoard'; // Import new component
+import { useDatabase } from '../context/DatabaseContext';
 
 const Tournament = () => {
+  const { dbEnv } = useDatabase();
   // Config State
   const [availableModels, setAvailableModels] = useState([]);
   const [selectedModels, setSelectedModels] = useState([]);
   const [rounds, setRounds] = useState(1);
   const [concurrency, setConcurrency] = useState(2);
+  const [mode, setMode] = useState('ROUND_ROBIN'); // 'ROUND_ROBIN' or 'EVALUATION'
+  const [targetModel, setTargetModel] = useState('');
   
   // Live State
   const [activeTournament, setActiveTournament] = useState(null);
@@ -27,16 +31,25 @@ const Tournament = () => {
   const [editingConcurrency, setEditingConcurrency] = useState(2);
   const [isUpdatingConfig, setIsUpdatingConfig] = useState(false);
 
-  // 2. Add Ref
+  // 2. Add Refs
   // Stores the ID of a tournament the user has explicitly closed/reset
-  const dismissedIdRef = useRef(null); 
+  const dismissedIdRef = useRef(null);
+  // NEW: Track what tournament ID we are actively watching
+  const viewingIdRef = useRef(null); 
 
   // --- Initialization & Polling ---
   useEffect(() => {
+    // Reset local state on DB switch
+    setActiveTournament(null);
+    setActiveGames([]);
+    setLoading(true);
+    viewingIdRef.current = null;
+    dismissedIdRef.current = null;
+
     fetchInitialData();
     const interval = setInterval(refreshStatus, 3000); // Poll every 3s
     return () => clearInterval(interval);
-  }, []);
+  }, [dbEnv]);
 
   const fetchInitialData = async () => {
     try {
@@ -48,9 +61,18 @@ const Tournament = () => {
 
       // 3. Logic Update: Don't load if dismissed (edge case on re-mount)
       if (tournamentData && dismissedIdRef.current !== tournamentData.id) {
-        setActiveTournament(tournamentData);
-        // Initialize editing concurrency with current config value
-        setEditingConcurrency(tournamentData.config?.concurrency || 2);
+        // SMART LOGIC: Only set as active if we should be watching it
+        // If tournament is COMPLETED/STOPPED on initial load, ignore it (show Setup)
+        if (tournamentData.status === 'COMPLETED' || tournamentData.status === 'STOPPED') {
+          // Don't set active tournament - user will see Setup screen
+          viewingIdRef.current = null;
+        } else {
+          // Tournament is active (SETUP, IN_PROGRESS, PAUSED) - show it
+          setActiveTournament(tournamentData);
+          viewingIdRef.current = tournamentData.id;
+          // Initialize editing concurrency with current config value
+          setEditingConcurrency(tournamentData.config?.concurrency || 2);
+        }
       }
       
       // Pre-select first 3 models if setup
@@ -67,14 +89,33 @@ const Tournament = () => {
   const refreshStatus = async () => {
     try {
       const t = await getCurrentTournament();
+      if (!t) {
+        // No tournament in DB - clear state
+        setActiveTournament(null);
+        viewingIdRef.current = null;
+        return;
+      }
       
       // 4. Logic Update: THE FIX
       // If the backend returns a tournament that matches our dismissed ID, ignore it.
-      if (t && dismissedIdRef.current === t.id) {
+      if (dismissedIdRef.current === t.id) {
         return; 
       }
 
+      // SMART LOGIC: Only show "Finished" screen if we were actively watching this tournament
+      if ((t.status === 'COMPLETED' || t.status === 'STOPPED') && viewingIdRef.current !== t.id) {
+        // Tournament finished but we weren't watching it - ignore and show Setup
+        return;
+      }
+
+      // If we get here, we should show this tournament
       setActiveTournament(t);
+      
+      // Track that we're now watching this tournament ID
+      if (viewingIdRef.current !== t.id) {
+        viewingIdRef.current = t.id;
+      }
+      
       // Update editing concurrency with current config value
       if (t) {
         setEditingConcurrency(t.config?.concurrency || 2);
@@ -95,21 +136,45 @@ const Tournament = () => {
   };
 
   // --- Handlers ---
+  // Reset target model when switching modes
+  useEffect(() => {
+    if (mode === 'ROUND_ROBIN') {
+      setTargetModel('');
+    }
+  }, [mode]);
+
   const toggleModel = (id) => {
     setSelectedModels(prev => 
       prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
     );
+    
+    // In evaluation mode, if we're selecting the target model, ensure it's in selected models
+    if (mode === 'EVALUATION' && targetModel === id && !selectedModels.includes(id)) {
+      setSelectedModels(prev => [...prev, id]);
+    }
   };
 
   const handleCreate = async () => {
     if (selectedModels.length < 2) return alert("Select at least 2 models");
+    if (mode === 'EVALUATION' && !targetModel) return alert("Select a target model for evaluation");
+    
     setLoading(true);
     try {
       // 5. Logic Update: Reset dismissal ref for the NEW tournament
       dismissedIdRef.current = null;
+      viewingIdRef.current = null;
       
-      const t = await createTournament(selectedModels, rounds, concurrency);
+      let t;
+      if (mode === 'ROUND_ROBIN') {
+        t = await createTournament(selectedModels, rounds, concurrency);
+      } else {
+        // For evaluation mode, filter out the target model from benchmarks
+        const benchmarks = selectedModels.filter(m => m !== targetModel);
+        t = await createEvaluationTournament(targetModel, benchmarks, rounds, concurrency);
+      }
+      
       setActiveTournament(t);
+      viewingIdRef.current = t.id;
     } catch (e) {
       alert("Failed to create tournament");
     } finally {
@@ -184,14 +249,20 @@ const Tournament = () => {
     // 6. Logic Update: Mark current ID as dismissed
     if (activeTournament) {
       dismissedIdRef.current = activeTournament.id;
+      viewingIdRef.current = null;
     }
     setActiveTournament(null); 
   };
 
   // --- Calculations ---
   const n = selectedModels.length;
-  const matchesPerRound = n * (n - 1);
+  const matchesPerRound = mode === 'ROUND_ROBIN' ? n * (n - 1) : n * 2;
   const totalCalculated = matchesPerRound * rounds;
+
+  // Helper to check if a game is snoozed due to rate limit
+  const isSnoozed = (game) => {
+    return game.status === 'PAUSED' && game.retry_after && new Date(game.retry_after) > new Date();
+  };
 
   if (loading && !activeTournament) return <div className="p-10 text-center">Loading...</div>;
 
@@ -316,6 +387,11 @@ const Tournament = () => {
                     <div className="flex justify-between items-center mb-3">
                        <span className="text-xs font-mono text-gray-400">#{game.id}</span>
                        <div className="flex gap-2">
+                         {isSnoozed(game) && (
+                           <span className="flex items-center gap-1 text-[10px] bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full animate-pulse">
+                             <Clock size={10} /> Rate Limit Cooldown
+                           </span>
+                         )}
                          <span className="flex items-center gap-1 text-[10px] font-bold text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-gray-800 px-2 py-0.5 rounded-full">
                            <RefreshCw size={10} className={activeTournament.status === 'IN_PROGRESS' ? 'animate-spin' : ''}/>
                            {game.move_count || 0}
@@ -347,12 +423,19 @@ const Tournament = () => {
                       </div>
                     </div>
 
-                    {/* Footer: Live Indicator */}
+                    {/* Footer: Status Indicator */}
                     <div className="mt-3 flex items-center justify-between border-t border-gray-50 dark:border-gray-800 pt-2">
-                        <span className="flex items-center gap-1.5 text-[10px] font-bold tracking-wider text-green-600 dark:text-green-400 uppercase">
-                          <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-                          Live
-                        </span>
+                        {isSnoozed(game) ? (
+                          <span className="flex items-center gap-1.5 text-[10px] font-bold tracking-wider text-amber-600 dark:text-amber-400 uppercase">
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                            Snoozed
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1.5 text-[10px] font-bold tracking-wider text-green-600 dark:text-green-400 uppercase">
+                            <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+                            Live
+                          </span>
+                        )}
                         <div className="text-gray-400 group-hover:text-brand-600 dark:group-hover:text-brand-400 transition-colors">
                            <ArrowIcon size={14} />
                         </div>
@@ -395,12 +478,43 @@ const Tournament = () => {
         <h1 className="text-2xl font-bold dark:text-white flex items-center gap-2">
            <Settings className="text-brand-600" /> Tournament Setup
         </h1>
-        <p className="text-gray-500 dark:text-gray-400">Configure an automated Round Robin tournament.</p>
+        <p className="text-gray-500 dark:text-gray-400">
+          {mode === 'ROUND_ROBIN' 
+            ? 'Configure an automated Round Robin tournament.' 
+            : 'Configure a focused Model Evaluation tournament.'}
+        </p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
          {/* Left: Configuration */}
          <div className="lg:col-span-2 space-y-6">
+            
+            {/* Mode Toggle */}
+            <div className="bg-white dark:bg-gray-900 p-6 rounded-xl border border-gray-200 dark:border-gray-800 shadow-sm">
+               <h3 className="font-semibold mb-4 flex items-center gap-2 dark:text-white">
+                 <Settings size={18} /> Tournament Mode
+               </h3>
+               <div className="flex gap-2">
+                 <button
+                   onClick={() => setMode('ROUND_ROBIN')}
+                   className={`flex-1 py-3 rounded-lg border transition-all ${mode === 'ROUND_ROBIN' 
+                     ? 'bg-brand-50 border-brand-500 dark:bg-brand-900/20 text-brand-700 dark:text-brand-300' 
+                     : 'bg-gray-50 border-gray-200 dark:bg-gray-800 dark:border-gray-700 text-gray-700 dark:text-gray-300 hover:border-gray-300'}`}
+                 >
+                   <div className="font-medium">Full Arena</div>
+                   <div className="text-xs mt-1">Round Robin (All vs All)</div>
+                 </button>
+                 <button
+                   onClick={() => setMode('EVALUATION')}
+                   className={`flex-1 py-3 rounded-lg border transition-all ${mode === 'EVALUATION' 
+                     ? 'bg-brand-50 border-brand-500 dark:bg-brand-900/20 text-brand-700 dark:text-brand-300' 
+                     : 'bg-gray-50 border-gray-200 dark:bg-gray-800 dark:border-gray-700 text-gray-700 dark:text-gray-300 hover:border-gray-300'}`}
+                 >
+                   <div className="font-medium">Model Evaluation</div>
+                   <div className="text-xs mt-1">Pivot Mode (Target vs Benchmarks)</div>
+                 </button>
+               </div>
+            </div>
             
             {/* Model Selection */}
             <div className="bg-white dark:bg-gray-900 p-6 rounded-xl border border-gray-200 dark:border-gray-800 shadow-sm">
@@ -423,6 +537,32 @@ const Tournament = () => {
                    </div>
                  ))}
                </div>
+               
+               {/* Target Model Selector for Evaluation Mode */}
+               {mode === 'EVALUATION' && (
+                 <div className="mt-6 pt-6 border-t border-gray-200 dark:border-gray-800">
+                   <h4 className="font-semibold mb-3 dark:text-white">Target Model (Being Evaluated)</h4>
+                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                     {availableModels.map(m => (
+                       <div 
+                         key={`target-${m.id}`}
+                         onClick={() => setTargetModel(m.id)}
+                         className={`p-3 rounded-lg border cursor-pointer transition-all flex items-center justify-between ${
+                           targetModel === m.id
+                             ? 'bg-brand-50 border-brand-500 dark:bg-brand-900/20'
+                             : 'bg-gray-50 border-gray-200 dark:bg-gray-800 dark:border-gray-700 hover:border-gray-300'
+                         }`}
+                       >
+                         <div className="text-sm font-medium dark:text-gray-200">{m.label}</div>
+                         {targetModel === m.id && <CheckCircle2 size={16} className="text-brand-600" />}
+                       </div>
+                     ))}
+                   </div>
+                   <p className="text-xs text-gray-500 mt-2">
+                     The target model will play 2 games (as P1 and P2) against each benchmark model.
+                   </p>
+                 </div>
+               )}
             </div>
 
             {/* Sliders */}
@@ -466,7 +606,7 @@ const Tournament = () => {
                    <span className="font-mono dark:text-gray-200">{n}</span>
                  </div>
                  <div className="flex justify-between">
-                   <span className="text-gray-500">Matchups (Round Robin)</span>
+                   <span className="text-gray-500">Matchups ({mode === 'ROUND_ROBIN' ? 'Round Robin' : 'Evaluation'})</span>
                    <span className="font-mono dark:text-gray-200">{matchesPerRound}</span>
                  </div>
                  <div className="flex justify-between">
@@ -480,9 +620,10 @@ const Tournament = () => {
                  <span className="text-xl font-bold text-brand-600">{totalCalculated}</span>
                </div>
 
-               {n < 2 ? (
+               {n < 2 || (mode === 'EVALUATION' && !targetModel) ? (
                  <div className="text-sm text-red-500 flex items-center gap-2 bg-red-50 p-3 rounded-lg">
-                   <AlertCircle size={16} /> Select at least 2 models
+                   <AlertCircle size={16} /> 
+                   {n < 2 ? 'Select at least 2 models' : 'Select a target model for evaluation'}
                  </div>
                ) : (
                  <button 
