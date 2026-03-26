@@ -1,0 +1,7 @@
+outputs_sft_*/
+outputs_grpo_*/
+connect4-agent-*/
+eval_results_*.json
+wandb/
+__pycache__/
+*.pyc
