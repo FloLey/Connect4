@@ -63,6 +63,32 @@ impl DataPoint {
     }
 }
 
+fn solve_boards_with_progress(boards: &[Board]) -> Vec<DataPoint> {
+    let done = AtomicUsize::new(0);
+    let total = boards.len();
+    let start = Instant::now();
+
+    let results: Vec<DataPoint> = boards
+        .par_iter()
+        .filter_map(|b| {
+            let result = DataPoint::from_board_thread_local(b);
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 1000 == 0 || n == total {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = n as f64 / elapsed;
+                let eta = (total - n) as f64 / rate;
+                eprint!(
+                    "\rSolving... {} / {} ({:.1}%) [depth ~{}] [{:.0} pos/sec, ETA: {}]  ",
+                    n, total, 100.0 * n as f64 / total as f64, b.moves, rate, fmt_eta(eta)
+                );
+            }
+            result
+        })
+        .collect();
+    eprintln!();
+    results
+}
+
 fn fmt_eta(secs: f64) -> String {
     let s = secs as u64;
     if s >= 60 {
@@ -131,28 +157,7 @@ pub fn generate_systematic(
     boards.sort_unstable_by_key(|b| std::cmp::Reverse(b.moves));
 
     // Phase 2: Solve in parallel — each thread has its own 160MB TT
-    let done = AtomicUsize::new(0);
-    let total = boards.len();
-    let start_solve = Instant::now();
-
-    let results: Vec<DataPoint> = boards
-        .par_iter()
-        .filter_map(|b| {
-            let result = DataPoint::from_board_thread_local(b);
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 1000 == 0 || n == total {
-                let elapsed = start_solve.elapsed().as_secs_f64();
-                let rate = n as f64 / elapsed;
-                let eta = (total - n) as f64 / rate;
-                eprint!(
-                    "\rSolving... {} / {} ({:.1}%) [depth ~{}] [{:.0} pos/sec, ETA: {}]  ",
-                    n, total, 100.0 * n as f64 / total as f64, b.moves, rate, fmt_eta(eta)
-                );
-            }
-            result
-        })
-        .collect();
-    eprintln!();
+    let results = solve_boards_with_progress(&boards);
 
     (results, seen)
 }
@@ -255,30 +260,7 @@ pub fn generate_random(
     eprintln!();
 
     // Phase 2: Solve in parallel — each thread has its own 160MB TT
-    let done = AtomicUsize::new(0);
-    let total = boards.len();
-    let start_solve = Instant::now();
-
-    let results: Vec<DataPoint> = boards
-        .par_iter()
-        .filter_map(|b| {
-            let result = DataPoint::from_board_thread_local(b);
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 1000 == 0 || n == total {
-                let elapsed = start_solve.elapsed().as_secs_f64();
-                let rate = n as f64 / elapsed;
-                let eta = (total - n) as f64 / rate;
-                eprint!(
-                    "\rSolving... {} / {} ({:.1}%) [depth ~{}] [{:.0} pos/sec, ETA: {}]  ",
-                    n, total, 100.0 * n as f64 / total as f64, b.moves, rate, fmt_eta(eta)
-                );
-            }
-            result
-        })
-        .collect();
-    eprintln!();
-
-    results
+    solve_boards_with_progress(&boards)
 }
 
 #[cfg(test)]
