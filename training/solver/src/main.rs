@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use board::{Board, COLS};
+use board::{Board, COLS, ROWS};
 use generator::{generate_random, generate_systematic, write_csv};
 use score::INVALID_SCORE;
 use solver::Solver;
@@ -280,7 +280,7 @@ fn cmd_bench() {
         let mut valid = true;
 
         for _ in 0..depth {
-            let legal: Vec<u32> = (0..COLS).filter(|&c| board.height(c) < 6).collect();
+            let legal: Vec<u32> = (0..COLS).filter(|&c| board.height(c) < ROWS).collect();
             if legal.is_empty() {
                 valid = false;
                 break;
