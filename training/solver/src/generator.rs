@@ -2,13 +2,19 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::cell::RefCell;
 
 use rand::rngs::StdRng;
 use rand::Rng;
+use rayon::prelude::*;
 
 use crate::board::{Board, COLS, ROWS};
 use crate::score::{self, INVALID_SCORE};
 use crate::solver::Solver;
+
+thread_local! {
+    static THREAD_SOLVER: RefCell<Solver> = RefCell::new(Solver::new());
+}
 
 pub struct DataPoint {
     pub move_sequence: String,
@@ -45,6 +51,14 @@ impl DataPoint {
             best_col,
         })
     }
+
+    fn from_board_thread_local(board: &Board) -> Option<Self> {
+        THREAD_SOLVER.with(|s| {
+            let mut solver = s.borrow_mut();
+            let mut b = board.clone();
+            Self::from_board(&mut b, &mut solver)
+        })
+    }
 }
 
 /// Write a batch of DataPoints to a CSV file.
@@ -78,43 +92,61 @@ pub fn write_csv(path: &Path, data: &[DataPoint]) -> std::io::Result<()> {
 }
 
 /// Generate all positions up to `max_depth` moves by DFS.
-pub fn generate_systematic(max_depth: u32, solver: &mut Solver) -> Vec<DataPoint> {
-    let mut results = Vec::new();
+/// Only solves positions at depth >= `min_solve_depth` (use 0 to solve all).
+/// Returns (data_points, seen_keys) so the seen set can be reused.
+pub fn generate_systematic(
+    max_depth: u32,
+    min_solve_depth: u32,
+) -> (Vec<DataPoint>, HashSet<u64>) {
     let mut seen = HashSet::new();
     let mut board = Board::new();
+    let mut boards = Vec::new();
 
     eprintln!(
-        "Generating systematic positions up to depth {}...",
-        max_depth
+        "Generating systematic positions up to depth {} (solving from depth {})...",
+        max_depth, min_solve_depth
     );
 
-    systematic_dfs(&mut board, max_depth, solver, &mut results, &mut seen);
+    // Phase 1: Collect all positions via DFS (sequential, cheap)
+    systematic_collect(&mut board, max_depth, min_solve_depth, &mut seen, &mut boards);
 
     eprintln!(
-        "Systematic generation complete: {} positions",
+        "Collected {} positions to solve ({} total enumerated)",
+        boards.len(),
+        seen.len()
+    );
+
+    // Phase 2: Solve in parallel using rayon
+    let results: Vec<DataPoint> = boards
+        .par_iter()
+        .filter_map(|b| DataPoint::from_board_thread_local(b))
+        .collect();
+
+    eprintln!(
+        "Systematic generation complete: {} positions solved",
         results.len()
     );
-    results
+    (results, seen)
 }
 
-fn systematic_dfs(
+fn systematic_collect(
     board: &mut Board,
     max_depth: u32,
-    solver: &mut Solver,
-    results: &mut Vec<DataPoint>,
+    min_solve_depth: u32,
     seen: &mut HashSet<u64>,
+    boards: &mut Vec<Board>,
 ) {
     let key = board.key();
     if !seen.insert(key) {
         return; // Already visited this position
     }
 
-    // Solve this position
-    if let Some(dp) = DataPoint::from_board(board, solver) {
-        results.push(dp);
+    // Only collect for solving if at sufficient depth
+    if board.moves >= min_solve_depth {
+        boards.push(board.clone());
 
-        if results.len() % 10000 == 0 {
-            eprintln!("  ... {} positions solved", results.len());
+        if boards.len() % 10000 == 0 {
+            eprintln!("  ... {} positions collected", boards.len());
         }
     }
 
@@ -132,7 +164,7 @@ fn systematic_dfs(
 
         // Only recurse if game isn't over
         if !board.is_game_over() {
-            systematic_dfs(board, max_depth, solver, results, seen);
+            systematic_collect(board, max_depth, min_solve_depth, seen, boards);
         }
 
         board.undo(col);
@@ -140,24 +172,28 @@ fn systematic_dfs(
 }
 
 /// Generate `count` random positions by playing random moves to a random depth.
-pub fn generate_random(count: usize, solver: &mut Solver, rng: &mut StdRng) -> Vec<DataPoint> {
-    let mut results = Vec::new();
-    let mut seen = HashSet::new();
-    let mut attempts = 0u64;
-
+/// Uses shared `seen` HashSet for deduplication across calls.
+/// Solves positions in parallel using rayon.
+pub fn generate_random(
+    count: usize,
+    rng: &mut StdRng,
+    seen: &mut HashSet<u64>,
+) -> Vec<DataPoint> {
     eprintln!("Generating {} random positions...", count);
 
-    while results.len() < count {
+    // Phase 1: Generate board positions (sequential, cheap)
+    let mut boards: Vec<Board> = Vec::with_capacity(count);
+    let mut attempts = 0u64;
+
+    while boards.len() < count {
         attempts += 1;
 
         // Random depth between 8 and 36
         let target_depth: u32 = rng.gen_range(8..=36);
         let mut board = Board::new();
 
-        // Play random moves
         let mut valid = true;
         for _ in 0..target_depth {
-            // Collect legal columns
             let legal: Vec<u32> = (0..COLS).filter(|&c| board.height(c) < ROWS).collect();
             if legal.is_empty() {
                 valid = false;
@@ -167,7 +203,6 @@ pub fn generate_random(count: usize, solver: &mut Solver, rng: &mut StdRng) -> V
             let col = legal[rng.gen_range(0..legal.len())];
             board.play(col);
 
-            // Check if game is over
             if board.is_game_over() {
                 valid = false;
                 break;
@@ -183,24 +218,33 @@ pub fn generate_random(count: usize, solver: &mut Solver, rng: &mut StdRng) -> V
             continue; // Duplicate position
         }
 
-        if let Some(dp) = DataPoint::from_board(&mut board, solver) {
-            results.push(dp);
+        boards.push(board);
 
-            if results.len() % 10000 == 0 {
-                eprintln!(
-                    "  ... {}/{} positions ({} attempts)",
-                    results.len(),
-                    count,
-                    attempts
-                );
-            }
+        if boards.len() % 10000 == 0 {
+            eprintln!(
+                "  ... {}/{} positions generated ({} attempts)",
+                boards.len(),
+                count,
+                attempts
+            );
         }
     }
 
     eprintln!(
-        "Random generation complete: {} positions ({} attempts)",
-        results.len(),
+        "Generated {} positions in {} attempts, solving in parallel...",
+        boards.len(),
         attempts
+    );
+
+    // Phase 2: Solve in parallel using rayon
+    let results: Vec<DataPoint> = boards
+        .par_iter()
+        .filter_map(|b| DataPoint::from_board_thread_local(b))
+        .collect();
+
+    eprintln!(
+        "Random generation complete: {} positions solved",
+        results.len()
     );
     results
 }
@@ -209,21 +253,16 @@ pub fn generate_random(count: usize, solver: &mut Solver, rng: &mut StdRng) -> V
 mod tests {
     use super::*;
 
-    /// Create a near-full board (36 moves) with no wins — alternating columns
-    /// to avoid any four-in-a-row. Only 6 empty cells remain.
+    /// Create a near-full board (36 moves) with no wins — alternating columns.
     fn make_near_full_board() -> Board {
         let mut b = Board::new();
-        // Fill columns in pairs to avoid horizontal/diagonal wins:
-        // Each column gets alternating P1/P2 pieces stacked vertically (max 3 each)
-        // Pattern: play col0,col1 repeatedly, then col2,col3, etc.
         let moves = [
-            0, 1, 0, 1, 0, 1, // col 0: P1,P1,P1  col 1: P2,P2,P2
-            2, 3, 2, 3, 2, 3, // col 2: P1,P1,P1  col 3: P2,P2,P2
-            4, 5, 4, 5, 4, 5, // col 4: P1,P1,P1  col 5: P2,P2,P2
-            // Now fill upper rows in reverse to avoid horizontals
-            1, 0, 1, 0, 1, 0, // col 1: P1,P1,P1  col 0: P2,P2,P2
-            3, 2, 3, 2, 3, 2, // col 3: P1,P1,P1  col 2: P2,P2,P2
-            5, 4, 5, 4, 5, 4, // col 5: P1,P1,P1  col 4: P2,P2,P2
+            0, 1, 0, 1, 0, 1,
+            2, 3, 2, 3, 2, 3,
+            4, 5, 4, 5, 4, 5,
+            1, 0, 1, 0, 1, 0,
+            3, 2, 3, 2, 3, 2,
+            5, 4, 5, 4, 5, 4,
         ];
         for &col in &moves {
             if b.height(col) < ROWS && !b.is_game_over() {
@@ -245,33 +284,17 @@ mod tests {
 
     #[test]
     fn test_csv_output() {
-        let mut solver = Solver::new();
-        let mut board = make_near_full_board();
-        if board.is_game_over() {
-            // Fallback: just test CSV writing with a manually constructed DataPoint
-            let dp = DataPoint {
-                move_sequence: "test".to_string(),
-                scores: [0.5, 0.3, -0.2, 0.9, -1.0, 0.1, -0.5],
-                best_col: 3,
-            };
-            let path = Path::new("/tmp/test_solver_output.csv");
-            write_csv(path, &[dp]).unwrap();
-            let content = fs::read_to_string(path).unwrap();
-            assert!(content.starts_with("move_sequence,col0,"));
-            let lines: Vec<&str> = content.trim().lines().collect();
-            assert_eq!(lines.len(), 2);
-            let _ = fs::remove_file(path);
-            return;
-        }
-
-        let dp = DataPoint::from_board(&mut board, &mut solver).unwrap();
+        let dp = DataPoint {
+            move_sequence: "test".to_string(),
+            scores: [0.5, 0.3, -0.2, 0.9, -1.0, 0.1, -0.5],
+            best_col: 3,
+        };
         let path = Path::new("/tmp/test_solver_output.csv");
         write_csv(path, &[dp]).unwrap();
-
         let content = fs::read_to_string(path).unwrap();
         assert!(content.starts_with("move_sequence,col0,"));
         let lines: Vec<&str> = content.trim().lines().collect();
-        assert_eq!(lines.len(), 2); // header + 1 row
+        assert_eq!(lines.len(), 2);
         let _ = fs::remove_file(path);
     }
 
