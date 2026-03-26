@@ -162,12 +162,12 @@ fn cmd_solve(move_sequence: &str) {
 }
 
 fn cmd_generate(mode: GenerateMode) {
-    let mut solver = Solver::new();
-
     match mode {
         GenerateMode::Systematic { max_depth, output } => {
             let start = Instant::now();
-            let data = generate_systematic(max_depth, &mut solver);
+            // Use min_solve_depth=8 to skip expensive early positions
+            let min_solve = max_depth.min(8);
+            let (data, _seen) = generate_systematic(max_depth, min_solve);
             let path = Path::new(&output).join(format!("systematic_d{}.csv", max_depth));
             write_csv(&path, &data).expect("Failed to write CSV");
             println!(
@@ -190,10 +190,11 @@ fn cmd_generate(mode: GenerateMode) {
             let batch_size = 100_000;
             let mut total = 0;
             let mut batch_idx = 0;
+            let mut seen = std::collections::HashSet::new();
 
             while total < count {
                 let this_batch = (count - total).min(batch_size);
-                let data = generate_random(this_batch, &mut solver, &mut rng);
+                let data = generate_random(this_batch, &mut rng, &mut seen);
                 let path =
                     Path::new(&output).join(format!("random_batch_{:03}.csv", batch_idx));
                 write_csv(&path, &data).expect("Failed to write CSV");
@@ -215,9 +216,9 @@ fn cmd_generate(mode: GenerateMode) {
         GenerateMode::Full { output, seed } => {
             let start = Instant::now();
 
-            // Systematic: depth <= 10
-            eprintln!("=== Phase 1: Systematic generation (depth <= 10) ===");
-            let systematic = generate_systematic(10, &mut solver);
+            // Systematic: depth <= 10, solving from depth 8+
+            eprintln!("=== Phase 1: Systematic generation (depth <= 10, solving >= 8) ===");
+            let (systematic, mut seen) = generate_systematic(10, 8);
             let path = Path::new(&output).join("systematic_d10.csv");
             write_csv(&path, &systematic).expect("Failed to write CSV");
             println!(
@@ -226,7 +227,7 @@ fn cmd_generate(mode: GenerateMode) {
                 path.display()
             );
 
-            // Random: 1M positions
+            // Random: 1M positions, reusing seen set from systematic phase
             eprintln!("\n=== Phase 2: Random generation (1M positions) ===");
             let mut rng = match seed {
                 Some(s) => StdRng::seed_from_u64(s),
@@ -239,7 +240,7 @@ fn cmd_generate(mode: GenerateMode) {
 
             while total < total_random {
                 let this_batch = (total_random - total).min(batch_size);
-                let data = generate_random(this_batch, &mut solver, &mut rng);
+                let data = generate_random(this_batch, &mut rng, &mut seen);
                 let path =
                     Path::new(&output).join(format!("random_batch_{:03}.csv", batch_idx));
                 write_csv(&path, &data).expect("Failed to write CSV");
