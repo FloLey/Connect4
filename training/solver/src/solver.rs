@@ -1,7 +1,6 @@
 use crate::board::{bit_index, Board, COLS, ROWS};
 
 const MOVE_ORDER: [u32; 7] = [3, 2, 4, 1, 5, 0, 6];
-const MAX_SCORE: i32 = ((COLS * ROWS - 1) / 2) as i32; // 20
 
 /// Bound type stored alongside transposition table entries.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -11,11 +10,43 @@ pub(crate) enum Bound {
     Upper, // true value <= stored value (no move improved alpha)
 }
 
-/// Fixed-size transposition table with bound type tracking.
+/// Packed TT entry: value (6 bits) + bound (2 bits) + best_move (3 bits) = 11 bits → u16
+/// Value is stored with +21 offset so range [-21,21] maps to [0,42] (fits in 6 bits).
+/// Bound: 0=empty, 1=Exact, 2=Lower, 3=Upper.
+/// Best move: column 0-6, or 7 = unknown.
+const VAL_OFFSET: i32 = 21;
+
+fn pack_entry(value: i32, bound: Bound, best_move: u32) -> u16 {
+    let v = (value + VAL_OFFSET) as u16 & 0x3F; // 6 bits
+    let b = match bound {
+        Bound::Exact => 1u16,
+        Bound::Lower => 2u16,
+        Bound::Upper => 3u16,
+    };
+    let m = (best_move.min(7) as u16) & 0x07; // 3 bits
+    v | (b << 6) | (m << 8)
+}
+
+fn unpack_entry(packed: u16) -> Option<(i32, Bound, u32)> {
+    let b = (packed >> 6) & 0x03;
+    if b == 0 {
+        return None; // empty
+    }
+    let v = (packed & 0x3F) as i32 - VAL_OFFSET;
+    let bound = match b {
+        1 => Bound::Exact,
+        2 => Bound::Lower,
+        3 => Bound::Upper,
+        _ => return None,
+    };
+    let m = ((packed >> 8) & 0x07) as u32;
+    Some((v, bound, m))
+}
+
+/// Fixed-size transposition table with packed entries (key + value/bound/best_move).
 pub struct TranspositionTable {
     keys: Vec<u64>,
-    values: Vec<i8>,
-    bounds: Vec<u8>, // 0 = empty, 1 = Exact, 2 = Lower, 3 = Upper
+    entries: Vec<u16>, // packed: value + bound + best_move
     size: usize,
 }
 
@@ -23,42 +54,29 @@ impl TranspositionTable {
     pub fn new(size: usize) -> Self {
         TranspositionTable {
             keys: vec![0; size],
-            values: vec![0; size],
-            bounds: vec![0; size],
+            entries: vec![0; size],
             size,
         }
     }
 
-    pub fn get(&self, key: u64) -> Option<(i8, Bound)> {
+    pub fn get(&self, key: u64) -> Option<(i32, Bound, u32)> {
         let idx = (key as usize) % self.size;
-        if self.keys[idx] == key && self.bounds[idx] != 0 {
-            let bound = match self.bounds[idx] {
-                1 => Bound::Exact,
-                2 => Bound::Lower,
-                3 => Bound::Upper,
-                _ => return None,
-            };
-            Some((self.values[idx], bound))
+        if self.keys[idx] == key {
+            unpack_entry(self.entries[idx])
         } else {
             None
         }
     }
 
-    pub fn put(&mut self, key: u64, value: i8, bound: Bound) {
+    pub fn put(&mut self, key: u64, value: i32, bound: Bound, best_move: u32) {
         let idx = (key as usize) % self.size;
         self.keys[idx] = key;
-        self.values[idx] = value;
-        self.bounds[idx] = match bound {
-            Bound::Exact => 1,
-            Bound::Lower => 2,
-            Bound::Upper => 3,
-        };
+        self.entries[idx] = pack_entry(value, bound, best_move);
     }
 
     pub fn reset(&mut self) {
         self.keys.fill(0);
-        self.values.fill(0);
-        self.bounds.fill(0);
+        self.entries.fill(0);
     }
 }
 
@@ -70,13 +88,12 @@ pub struct Solver {
 impl Solver {
     pub fn new() -> Self {
         Solver {
-            table: TranspositionTable::new(24_000_001), // ~24M entries
+            table: TranspositionTable::new(24_000_001),
             node_count: 0,
         }
     }
 
-    /// Returns the exact score for the given position using iterative deepening
-    /// with null-window search (binary search over the score range).
+    /// Returns the exact score using iterative deepening with null-window search.
     pub fn solve(&mut self, board: &mut Board) -> i32 {
         // Terminal: previous player already won
         if board.is_win(board.opponent_board()) {
@@ -96,10 +113,8 @@ impl Solver {
         let mut min = -(((COLS * ROWS) as i32 - 2 - board.moves as i32) / 2);
         let mut max = ((COLS * ROWS) as i32 - 1 - board.moves as i32) / 2;
 
-        // Narrow bounds from TT if available
-        let key = board.key();
-        if let Some((raw, bound)) = self.table.get(key) {
-            let val = raw as i32 - 18;
+        // Narrow bounds from TT
+        if let Some((val, bound, _)) = self.table.get(board.key()) {
             match bound {
                 Bound::Exact => return val,
                 Bound::Lower => {
@@ -118,7 +133,6 @@ impl Solver {
         // Iterative deepening with null-window search
         while min < max {
             let mut med = min + (max - min) / 2;
-            // Bias toward zero to converge faster
             if med <= 0 && min / 2 < med {
                 med = min / 2;
             } else if med >= 0 && max / 2 > med {
@@ -138,17 +152,14 @@ impl Solver {
     fn negamax(&mut self, board: &mut Board, mut alpha: i32, mut beta: i32) -> i32 {
         self.node_count += 1;
 
-        // Draw check
         if board.is_full() {
             return 0;
         }
 
-        // Check if current player can win immediately
         if board.winning_moves() != 0 {
             return ((COLS * ROWS) as i32 + 1 - board.moves as i32) / 2;
         }
 
-        // Upper bound: can't win on next move, so earliest win is in 2 more moves
         let max_possible = ((COLS * ROWS) as i32 - 1 - board.moves as i32) / 2;
         if max_possible <= 0 {
             return 0;
@@ -160,14 +171,13 @@ impl Solver {
             }
         }
 
-        // Get non-losing moves (excludes moves that give opponent immediate win)
+        // Non-losing moves filter
         let non_losing = board.non_losing_moves();
         if non_losing == 0 {
-            // All moves lose — opponent wins on their next turn
             return -(((COLS * ROWS) as i32 - board.moves as i32) / 2);
         }
 
-        // Lower bound: we can't lose worse than opponent winning after our move + their move
+        // Lower bound pruning
         let min_possible = -(((COLS * ROWS) as i32 - 2 - board.moves as i32) / 2);
         if alpha < min_possible {
             alpha = min_possible;
@@ -176,11 +186,12 @@ impl Solver {
             }
         }
 
-        // Transposition table lookup
+        // TT lookup — also retrieve best move for ordering
         let key = board.key();
         let original_alpha = alpha;
-        if let Some((stored_raw, bound)) = self.table.get(key) {
-            let val = stored_raw as i32 - 18;
+        let mut tt_best_move: Option<u32> = None;
+
+        if let Some((val, bound, best_move)) = self.table.get(key) {
             match bound {
                 Bound::Exact => return val,
                 Bound::Lower => {
@@ -203,11 +214,13 @@ impl Solver {
             if alpha >= beta {
                 return val;
             }
+            if best_move < COLS {
+                tt_best_move = Some(best_move);
+            }
         }
 
-        // Dynamic move ordering: score each non-losing move and sort by move_score
-        let mut move_entries: [(u32, u32); 7] = [(0, 0); 7];
-        let mut n_moves = 0;
+        // Anticipation: filter moves that allow opponent double threat
+        let mut dominated = non_losing;
         for &col in &MOVE_ORDER {
             let h = board.height(col);
             if h >= ROWS {
@@ -217,12 +230,40 @@ impl Solver {
             if non_losing & bit == 0 {
                 continue;
             }
-            let score = board.move_score(col);
+
+            board.play(col);
+            if board.can_create_double_threat() {
+                dominated &= !bit;
+            }
+            board.undo(col);
+        }
+
+        if dominated == 0 {
+            dominated = non_losing;
+        }
+
+        // Build move list with scores, TT best move gets highest priority
+        let mut move_entries: [(u32, u32); 7] = [(0, 0); 7];
+        let mut n_moves = 0;
+        for &col in &MOVE_ORDER {
+            let h = board.height(col);
+            if h >= ROWS {
+                continue;
+            }
+            let bit = 1u64 << bit_index(col, h);
+            if dominated & bit == 0 {
+                continue;
+            }
+            let mut score = board.move_score(col);
+            // Boost TT best move to ensure it's explored first
+            if tt_best_move == Some(col) {
+                score += 1000;
+            }
             move_entries[n_moves] = (col, score);
             n_moves += 1;
         }
 
-        // Sort by move_score descending (insertion sort on small array)
+        // Sort by score descending (insertion sort, small array)
         for i in 1..n_moves {
             let mut j = i;
             while j > 0 && move_entries[j].1 > move_entries[j - 1].1 {
@@ -232,6 +273,7 @@ impl Solver {
         }
 
         let mut best = i32::MIN;
+        let mut best_col = 7u32; // invalid sentinel
 
         for i in 0..n_moves {
             let col = move_entries[i].0;
@@ -241,10 +283,11 @@ impl Solver {
 
             if score > best {
                 best = score;
+                best_col = col;
             }
 
             if score >= beta {
-                self.table.put(key, (score + 18) as i8, Bound::Lower);
+                self.table.put(key, score, Bound::Lower, col);
                 return score;
             }
 
@@ -262,12 +305,11 @@ impl Solver {
         } else {
             Bound::Upper
         };
-        self.table.put(key, (alpha + 18) as i8, bound);
+        self.table.put(key, alpha, bound, best_col);
         alpha
     }
 
     /// Returns a Vec of (col, score) pairs for all legal moves, sorted best to worst.
-    /// Accumulates total node_count across all column solves.
     pub fn rank_moves(&mut self, board: &mut Board) -> Vec<(u32, i32)> {
         if board.is_win(board.opponent_board()) || board.is_full() {
             return vec![];
@@ -346,7 +388,7 @@ mod tests {
         }
         if !board.is_game_over() {
             let score = solver.solve(&mut board);
-            assert!(score >= -MAX_SCORE && score <= MAX_SCORE);
+            assert!(score >= -21 && score <= 21);
         }
     }
 
@@ -412,19 +454,21 @@ mod tests {
     }
 
     #[test]
-    fn test_transposition_table_bounds() {
+    fn test_transposition_table() {
         let mut tt = TranspositionTable::new(1024);
         assert!(tt.get(42).is_none());
 
-        tt.put(42, 25, Bound::Exact);
-        let (val, bound) = tt.get(42).unwrap();
-        assert_eq!(val, 25);
+        tt.put(42, 7, Bound::Exact, 3);
+        let (val, bound, best_move) = tt.get(42).unwrap();
+        assert_eq!(val, 7);
         assert_eq!(bound, Bound::Exact);
+        assert_eq!(best_move, 3);
 
-        tt.put(42, 20, Bound::Lower);
-        let (val, bound) = tt.get(42).unwrap();
-        assert_eq!(val, 20);
+        tt.put(42, -5, Bound::Lower, 1);
+        let (val, bound, best_move) = tt.get(42).unwrap();
+        assert_eq!(val, -5);
         assert_eq!(bound, Bound::Lower);
+        assert_eq!(best_move, 1);
 
         tt.reset();
         assert!(tt.get(42).is_none());
