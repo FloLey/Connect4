@@ -95,7 +95,12 @@ impl Board {
 
     /// Returns a bitmask of all cells where the current player can win immediately.
     pub fn winning_moves(&self) -> u64 {
-        self.compute_winning_positions(self.position) & self.legal_moves_mask()
+        Self::compute_winning_positions(self.position) & self.legal_moves_mask()
+    }
+
+    /// Returns a bitmask of all cells where the opponent could win if it were their turn.
+    pub fn opponent_winning_moves(&self) -> u64 {
+        Self::compute_winning_positions(self.mask ^ self.position) & self.legal_moves_mask()
     }
 
     /// Returns a bitmask of all cells that are legal next moves.
@@ -132,55 +137,40 @@ impl Board {
         self.is_full() || self.is_win(self.opponent_board())
     }
 
-    /// Compute all positions where `player` would complete a four-in-a-row
-    /// if they placed a piece there.
-    fn compute_winning_positions(&self, player: u64) -> u64 {
-        let mut result: u64;
+    /// Compute all cells where placing a piece would complete a four-in-a-row
+    /// for the given player. Uses Pascal Pons' method: for each direction,
+    /// enumerate all 4 gap patterns (XXX_, _XXX, XX_X, X_XX).
+    fn compute_winning_positions(pos: u64) -> u64 {
+        let mut r = 0u64;
 
-        // Vertical (stride = 1): 3 in a column, winning cell is 3 above the bottom
-        let m_v = player & (player >> 1) & (player >> 2);
-        result = m_v << 3;
+        // Vertical (stride 1) — only one pattern due to gravity: pieces below, win on top
+        r |= (pos << 1) & (pos << 2) & (pos << 3);
 
-        // Horizontal (stride = 7)
-        result |= Self::direction_wins(player, 7);
-        // Diagonal / (stride = 8)
-        result |= Self::direction_wins(player, 8);
-        // Diagonal \ (stride = 6)
-        result |= Self::direction_wins(player, 6);
+        // Horizontal (stride 7) — all 4 patterns
+        let p = (pos << 7) & (pos << 14);
+        r |= p & (pos << 21); // XXX_
+        r |= p & (pos >> 7); // XX_X
+        let p = (pos >> 7) & (pos >> 14);
+        r |= p & (pos << 7); // X_XX
+        r |= p & (pos >> 21); // _XXX
 
-        // Only return cells that are within the playable area (not sentinel rows)
-        let mut board_mask = 0u64;
-        for col in 0..COLS {
-            for row in 0..ROWS {
-                board_mask |= 1u64 << bit_index(col, row);
-            }
-        }
-        result & board_mask & !self.mask
-    }
+        // Diagonal / (stride 8) — all 4 patterns
+        let p = (pos << 8) & (pos << 16);
+        r |= p & (pos << 24);
+        r |= p & (pos >> 8);
+        let p = (pos >> 8) & (pos >> 16);
+        r |= p & (pos << 8);
+        r |= p & (pos >> 24);
 
-    /// For a given direction stride, compute all cells where placing a piece
-    /// would complete a 4-in-a-row for the given player in that direction.
-    fn direction_wins(player: u64, stride: u32) -> u64 {
-        let s = stride;
-        let mut result = 0u64;
+        // Diagonal \ (stride 6) — all 4 patterns
+        let p = (pos << 6) & (pos << 12);
+        r |= p & (pos << 18);
+        r |= p & (pos >> 6);
+        let p = (pos >> 6) & (pos >> 12);
+        r |= p & (pos << 6);
+        r |= p & (pos >> 18);
 
-        // Pattern: _ X X X
-        let m = player & (player >> s) & (player >> (2 * s));
-        result |= m << s;
-
-        // Pattern: X _ X X
-        let m = (player << s) & (player >> s) & (player >> (2 * s));
-        result |= m;
-
-        // Pattern: X X _ X
-        let m = (player << (2 * s)) & (player << s) & (player >> s);
-        result |= m;
-
-        // Pattern: X X X _
-        let m = player & (player << s) & (player << (2 * s));
-        result |= m >> s;
-
-        result
+        r
     }
 }
 
@@ -260,6 +250,42 @@ mod tests {
     fn test_is_full() {
         let b = Board::new();
         assert!(!b.is_full());
+    }
+
+    #[test]
+    fn test_winning_moves_vertical() {
+        let mut b = Board::new();
+        // P1: col 0, P2: col 1, repeat 3 times → P1 has 3 in col 0
+        b.play(0); b.play(1); b.play(0); b.play(1); b.play(0); b.play(1);
+        // P1 to move with 3 in col 0 (rows 0,1,2), winning cell is row 3
+        let wm = b.winning_moves();
+        assert_ne!(wm, 0, "Should detect vertical win opportunity");
+        // The winning cell should be bit_index(0, 3) = 3
+        assert_ne!(wm & (1u64 << bit_index(0, 3)), 0);
+    }
+
+    #[test]
+    fn test_winning_moves_horizontal() {
+        let mut b = Board::new();
+        // P1 places at cols 0,1,2 (bottom row), P2 at col 6
+        b.play(0); b.play(6); b.play(1); b.play(6); b.play(2); b.play(6);
+        // P1 to move with 3 horizontal at row 0, can win with col 3
+        let wm = b.winning_moves();
+        assert_ne!(wm, 0, "Should detect horizontal win opportunity");
+        assert_ne!(wm & (1u64 << bit_index(3, 0)), 0);
+    }
+
+    #[test]
+    fn test_opponent_winning_moves() {
+        let mut b = Board::new();
+        // P1: col 0, P2: col 1, repeat → P2 has 3 in col 1
+        b.play(0); b.play(1); b.play(0); b.play(1); b.play(0); b.play(1);
+        // After P2's last move (move 6), P1 is to move.
+        b.play(6); // P1 wastes a move on col 6
+        // Now P2 to move, but let's check from P1's perspective of opponent threats
+        // Actually after 7 moves, P2 is current player. P1 (opponent) has 3 in col 0.
+        let opp_wm = b.opponent_winning_moves();
+        assert_ne!(opp_wm, 0, "Should detect opponent's win threat");
     }
 
     #[test]

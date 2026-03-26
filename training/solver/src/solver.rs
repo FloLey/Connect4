@@ -100,8 +100,7 @@ impl Solver {
         }
 
         // Check if opponent can win next move — if so, we must block
-        // (This is an optimization: if opponent has a winning move, we must play there)
-        let opponent_win = self.opponent_winning_moves(board);
+        let opponent_win = board.opponent_winning_moves();
         if opponent_win != 0 {
             // Count opponent winning moves — if more than 1, we lose
             if (opponent_win & (opponent_win - 1)) != 0 {
@@ -109,7 +108,6 @@ impl Solver {
                 return -(((COLS * ROWS) as i32 - board.moves as i32) / 2);
             }
             // Exactly one threat — we must play there (forced move)
-            // Find which column the threat is in and play it
             for col in 0..COLS {
                 let h = board.height(col);
                 if h < ROWS {
@@ -172,56 +170,6 @@ impl Solver {
 
         self.table.put(key, (alpha + 18) as i8);
         alpha
-    }
-
-    /// Compute opponent's winning moves by temporarily switching perspective.
-    fn opponent_winning_moves(&self, board: &Board) -> u64 {
-        // The opponent's pieces are mask ^ position.
-        // We need to find cells where opponent would complete 4-in-a-row.
-        let opponent = board.mask ^ board.position;
-        self.compute_winning_positions_for(opponent, board)
-    }
-
-    /// Compute winning positions for a given player bitboard.
-    fn compute_winning_positions_for(&self, player: u64, board: &Board) -> u64 {
-        let mut result: u64;
-
-        // Vertical: 3 in a row, winning cell is 3 above the bottom
-        let m_v = player & (player >> 1) & (player >> 2);
-        result = m_v << 3;
-
-        // Horizontal
-        result |= Self::direction_wins_static(player, 7);
-        // Diagonal /
-        result |= Self::direction_wins_static(player, 8);
-        // Diagonal \
-        result |= Self::direction_wins_static(player, 6);
-
-        // Only return cells that are legal moves (not already occupied, within board)
-        result & board.legal_moves_mask()
-    }
-
-    fn direction_wins_static(player: u64, stride: u32) -> u64 {
-        let s = stride;
-        let mut result = 0u64;
-
-        // _ X X X
-        let m = player & (player >> s) & (player >> (2 * s));
-        result |= m << s;
-
-        // X _ X X
-        let m = (player << s) & (player >> s) & (player >> (2 * s));
-        result |= m;
-
-        // X X _ X
-        let m = (player << (2 * s)) & (player << s) & (player >> s);
-        result |= m;
-
-        // X X X _
-        let m = player & (player << s) & (player << (2 * s));
-        result |= m >> s;
-
-        result
     }
 
     /// Returns a Vec of (col, score) pairs for all legal moves, sorted best to worst.
