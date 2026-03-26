@@ -122,7 +122,7 @@ Download the JSON files and compare:
 On the pod with the best eval results:
 
 ```bash
-python connect4_train.py --model {4b,8b,14b} --stage export --csv connect4_data.csv
+python connect4_train.py --model 8b --stage export --csv connect4_data.csv
 ```
 
 This creates:
