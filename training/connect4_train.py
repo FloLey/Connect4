@@ -69,8 +69,16 @@ def format_prompt(move_sequence):
     moves_desc = ", ".join(f"{'P1' if i%2==0 else 'P2'} -> col {m}" for i,m in enumerate(move_sequence))
     return f"Move history: {move_sequence}\nMoves played: {moves_desc}\nIt's your turn. Which column do you play?"
 
+def split_data(csv_path):
+    """Single deterministic train/eval split to prevent data leakage."""
+    raw_data = load_csv_data(csv_path)
+    random.seed(42)
+    random.shuffle(raw_data)
+    eval_data = raw_data[-10_000:]
+    train_data = raw_data[:-10_000]
+    return train_data, eval_data
+
 def prepare_sft_dataset(data, max_rows, tokenizer):
-    random.shuffle(data)
     formatted = []
     for entry in data[:max_rows]:
         conv = [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":format_prompt(entry["move_sequence"])},{"role":"assistant","content":str(entry["best_col"])}]
@@ -78,50 +86,50 @@ def prepare_sft_dataset(data, max_rows, tokenizer):
     return Dataset.from_list(formatted)
 
 def prepare_grpo_dataset(data, max_rows, tokenizer):
-    random.shuffle(data)
     formatted = []
     for entry in data[:max_rows]:
         conv = [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":format_prompt(entry["move_sequence"])}]
         formatted.append({"prompt": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=True), "move_sequence": entry["move_sequence"]})
     return Dataset.from_list(formatted)
 
-SCORE_LOOKUP = {}
-
 def extract_column_from_response(text):
     digits = re.findall(r'[0-6]', text.strip())
     return int(digits[-1]) if digits else None
 
-def reward_format(completions, **kwargs):
-    return [0.5 if extract_column_from_response(c) is not None else -1.0 for c in completions]
+class RewardCalculator:
+    def __init__(self, data):
+        self.score_lookup = build_lookup_table(data)
 
-def reward_move_quality(completions, move_sequence, **kwargs):
-    rewards = []
-    for c, seq in zip(completions, move_sequence):
-        col = extract_column_from_response(c)
-        if col is None: rewards.append(-1.0); continue
-        scores = SCORE_LOOKUP.get(seq)
-        rewards.append(scores[col] if scores else 0.0)
-    return rewards
+    def reward_format(self, completions, **kwargs):
+        return [0.5 if extract_column_from_response(c) is not None else -1.0 for c in completions]
 
-def reward_is_best_move(completions, move_sequence, **kwargs):
-    rewards = []
-    for c, seq in zip(completions, move_sequence):
-        col = extract_column_from_response(c)
-        if col is None: rewards.append(-0.5); continue
-        scores = SCORE_LOOKUP.get(seq)
-        if not scores: rewards.append(0.0); continue
-        rewards.append(1.0 if col == max(range(7), key=lambda x: scores[x]) else 0.0)
-    return rewards
+    def reward_move_quality(self, completions, move_sequence, **kwargs):
+        rewards = []
+        for c, seq in zip(completions, move_sequence):
+            col = extract_column_from_response(c)
+            if col is None: rewards.append(-1.0); continue
+            scores = self.score_lookup.get(seq)
+            rewards.append(scores[col] if scores else 0.0)
+        return rewards
 
-def run_sft(config):
+    def reward_is_best_move(self, completions, move_sequence, **kwargs):
+        rewards = []
+        for c, seq in zip(completions, move_sequence):
+            col = extract_column_from_response(c)
+            if col is None: rewards.append(-0.5); continue
+            scores = self.score_lookup.get(seq)
+            if not scores: rewards.append(0.0); continue
+            rewards.append(1.0 if col == max(range(7), key=lambda x: scores[x]) else 0.0)
+        return rewards
+
+def run_sft(config, train_data):
     from unsloth import FastLanguageModel
     from trl import SFTTrainer, SFTConfig
     print(f"\n{'='*60}\nSTAGE 1: SFT -- {config['model_name']}\n{'='*60}")
     model, tokenizer = FastLanguageModel.from_pretrained(model_name=config["model_name"], max_seq_length=config["max_seq_length"], load_in_4bit=config["load_in_4bit"])
     model = FastLanguageModel.get_peft_model(model, r=config["lora_r"], lora_alpha=config["lora_alpha"], lora_dropout=config["lora_dropout"], target_modules=config["target_modules"])
-    raw_data = load_csv_data(config["csv_path"])
-    print(f"Loaded {len(raw_data)} positions")
-    dataset = prepare_sft_dataset(raw_data, config["sft_max_rows"], tokenizer)
+    print(f"Training on {len(train_data)} positions")
+    dataset = prepare_sft_dataset(train_data, config["sft_max_rows"], tokenizer)
     run_name = f"sft-{config['model_size']}"
     if WANDB_AVAILABLE:
         wandb.init(project=config["wandb_project"], name=run_name, tags=[config["model_size"],"sft"], config={"model":config["model_name"],"stage":"sft","lora_r":config["lora_r"]}, reinit=True)
@@ -137,7 +145,7 @@ def run_sft(config):
     model.save_pretrained(config["sft_output"]); tokenizer.save_pretrained(config["sft_output"])
     print(f"SFT saved to {config['sft_output']}")
 
-def run_grpo(config):
+def run_grpo(config, train_data):
     from unsloth import FastLanguageModel
     from trl import GRPOConfig, GRPOTrainer
     print(f"\n{'='*60}\nSTAGE 2: GRPO -- {config['model_name']}\n{'='*60}")
@@ -146,14 +154,13 @@ def run_grpo(config):
     else:
         model, tokenizer = FastLanguageModel.from_pretrained(model_name=config["model_name"], max_seq_length=config["max_seq_length"], load_in_4bit=config["load_in_4bit"])
         model = FastLanguageModel.get_peft_model(model, r=config["lora_r"], lora_alpha=config["lora_alpha"], lora_dropout=config["lora_dropout"], target_modules=config["target_modules"])
-    raw_data = load_csv_data(config["csv_path"])
-    global SCORE_LOOKUP; SCORE_LOOKUP = build_lookup_table(raw_data)
-    print(f"Loaded {len(raw_data)} positions, {len(SCORE_LOOKUP)} in lookup")
-    dataset = prepare_grpo_dataset(raw_data, config["grpo_max_rows"], tokenizer)
+    reward_calc = RewardCalculator(train_data)
+    print(f"Training on {len(train_data)} positions, {len(reward_calc.score_lookup)} in lookup")
+    dataset = prepare_grpo_dataset(train_data, config["grpo_max_rows"], tokenizer)
     run_name = f"grpo-{config['model_size']}"
     if WANDB_AVAILABLE:
         wandb.init(project=config["wandb_project"], name=run_name, tags=[config["model_size"],"grpo"], config={"model":config["model_name"],"stage":"grpo","num_generations":config["grpo_num_generations"],"temperature":config["grpo_temperature"]}, reinit=True)
-    trainer = GRPOTrainer(model=model, processing_class=tokenizer, reward_funcs=[reward_format, reward_move_quality, reward_is_best_move],
+    trainer = GRPOTrainer(model=model, processing_class=tokenizer, reward_funcs=[reward_calc.reward_format, reward_calc.reward_move_quality, reward_calc.reward_is_best_move],
         args=GRPOConfig(output_dir=config["grpo_output"], temperature=config["grpo_temperature"], num_generations=config["grpo_num_generations"],
             max_prompt_length=256, max_completion_length=256, learning_rate=config["grpo_learning_rate"],
             per_device_train_batch_size=config["grpo_batch_size"], gradient_accumulation_steps=config["grpo_grad_accum"],
@@ -166,7 +173,7 @@ def run_grpo(config):
     model.save_pretrained(config["grpo_output"]); tokenizer.save_pretrained(config["grpo_output"])
     print(f"GRPO saved to {config['grpo_output']}")
 
-def run_eval(config):
+def run_eval(config, eval_data):
     from unsloth import FastLanguageModel
     print(f"\n{'='*60}\nEVALUATION -- {config['model_size'].upper()}\n{'='*60}")
     checkpoint_dir = None
@@ -175,7 +182,6 @@ def run_eval(config):
     if not checkpoint_dir: print("ERROR: No model found"); return
     model, tokenizer = FastLanguageModel.from_pretrained(model_name=checkpoint_dir, max_seq_length=config["max_seq_length"], load_in_4bit=config["load_in_4bit"])
     FastLanguageModel.for_inference(model)
-    raw_data = load_csv_data(config["csv_path"]); random.seed(42); random.shuffle(raw_data); eval_data = raw_data[-10_000:]
     print(f"Evaluating on {len(eval_data)} held-out positions...")
     exact=0; top2=0; score_sum=0.0; valid=0; invalid=0
     phase_stats = {p: {"correct":0,"total":0,"score_sum":0.0} for p in ["opening (0-8 moves)","midgame (9-20 moves)","endgame (21+ moves)"]}
@@ -194,7 +200,11 @@ def run_eval(config):
         phase_stats[phase]["total"]+=1; phase_stats[phase]["score_sum"]+=scores[col]
     total=valid+invalid
     print(f"\nRESULTS -- {config['model_size'].upper()}")
+    if total == 0:
+        print("  No positions evaluated."); return
     print(f"  Valid: {valid}/{total} ({100*valid/total:.1f}%)")
+    if valid == 0:
+        print("  No valid outputs to score."); return
     print(f"  Exact match: {exact}/{valid} ({100*exact/valid:.1f}%)")
     print(f"  Top-2 match: {top2}/{valid} ({100*top2/valid:.1f}%)")
     print(f"  Mean oracle score: {score_sum/valid:+.4f}")
@@ -253,9 +263,11 @@ def main():
     if args.no_wandb: global WANDB_AVAILABLE; WANDB_AVAILABLE = False
     config = get_config(args.model); config["csv_path"] = args.csv; config["hf_repo"] = args.hf_repo
     print(f"\nConnect Four Pipeline | Model: {config['model_name']} | Stage: {args.stage} | Wandb: {'on' if WANDB_AVAILABLE else 'off'}")
-    if args.stage in ("sft","both"): run_sft(config)
-    if args.stage in ("grpo","both"): run_grpo(config)
-    if args.stage == "eval": run_eval(config)
+    train_data, eval_data = split_data(config["csv_path"])
+    print(f"Data split: {len(train_data)} train, {len(eval_data)} eval (seed=42, no overlap)")
+    if args.stage in ("sft","both"): run_sft(config, train_data)
+    if args.stage in ("grpo","both"): run_grpo(config, train_data)
+    if args.stage == "eval": run_eval(config, eval_data)
     if args.stage == "export": export_model(config)
     if args.stage == "push": push_to_hub(config)
 
