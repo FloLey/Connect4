@@ -93,10 +93,26 @@ fn cmd_solve(move_sequence: &str) {
         },
         board.moves
     );
-    println!("Solving...\n");
 
     let start = Instant::now();
     let mut solver = Solver::new();
+
+    // Check if the game is already over
+    if board.is_win(board.opponent_board()) {
+        let elapsed = start.elapsed();
+        let score = solver.solve(&mut board);
+        println!("Game is already over. The player who just moved WON.");
+        println!("Score: {} (from current player's perspective)", score);
+        println!("Time: {:.2?}", elapsed);
+        return;
+    }
+    if board.is_full() {
+        println!("Game is already over. DRAW (board full).");
+        return;
+    }
+
+    println!("Solving...\n");
+
     let ranked = solver.rank_moves(&mut board);
     let elapsed = start.elapsed();
 

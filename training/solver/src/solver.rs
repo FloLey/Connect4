@@ -3,10 +3,19 @@ use crate::board::{Board, COLS, ROWS};
 const MOVE_ORDER: [u32; 7] = [3, 2, 4, 1, 5, 0, 6];
 const MAX_SCORE: i32 = ((COLS * ROWS - 1) / 2) as i32; // 20
 
-/// Fixed-size transposition table with simple replacement.
+/// Bound type stored alongside transposition table entries.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Bound {
+    Exact,
+    Lower, // true value >= stored value (beta cutoff)
+    Upper, // true value <= stored value (no move improved alpha)
+}
+
+/// Fixed-size transposition table with bound type tracking.
 pub struct TranspositionTable {
     keys: Vec<u64>,
     values: Vec<i8>,
+    bounds: Vec<u8>, // 0 = empty, 1 = Exact, 2 = Lower, 3 = Upper
     size: usize,
 }
 
@@ -15,28 +24,41 @@ impl TranspositionTable {
         TranspositionTable {
             keys: vec![0; size],
             values: vec![0; size],
+            bounds: vec![0; size],
             size,
         }
     }
 
-    pub fn get(&self, key: u64) -> Option<i8> {
+    pub fn get(&self, key: u64) -> Option<(i8, Bound)> {
         let idx = (key as usize) % self.size;
-        if self.keys[idx] == key && self.values[idx] != 0 {
-            Some(self.values[idx])
+        if self.keys[idx] == key && self.bounds[idx] != 0 {
+            let bound = match self.bounds[idx] {
+                1 => Bound::Exact,
+                2 => Bound::Lower,
+                3 => Bound::Upper,
+                _ => return None,
+            };
+            Some((self.values[idx], bound))
         } else {
             None
         }
     }
 
-    pub fn put(&mut self, key: u64, value: i8) {
+    pub fn put(&mut self, key: u64, value: i8, bound: Bound) {
         let idx = (key as usize) % self.size;
         self.keys[idx] = key;
         self.values[idx] = value;
+        self.bounds[idx] = match bound {
+            Bound::Exact => 1,
+            Bound::Lower => 2,
+            Bound::Upper => 3,
+        };
     }
 
     pub fn reset(&mut self) {
         self.keys.fill(0);
         self.values.fill(0);
+        self.bounds.fill(0);
     }
 }
 
@@ -55,13 +77,11 @@ impl Solver {
 
     /// Returns the exact score for the given position.
     pub fn solve(&mut self, board: &mut Board) -> i32 {
-        self.node_count = 0;
-
-        // Check if the previous player already won
+        // Check if the previous player already won.
+        // They chose their winning move when board.moves was (board.moves - 1),
+        // so their win score was (43 - (board.moves - 1)) / 2. We negate it.
         if board.is_win(board.opponent_board()) {
-            // The player who just moved won; current player loses.
-            let moves_at_win = board.moves;
-            return -(((COLS * ROWS) as i32 + 1 - moves_at_win as i32) / 2);
+            return -(((COLS * ROWS) as i32 + 2 - board.moves as i32) / 2);
         }
 
         if board.is_full() {
@@ -90,7 +110,7 @@ impl Solver {
         // Upper bound: best possible score (win on next move is impossible, so at least 2 more moves)
         let max_possible = ((COLS * ROWS) as i32 - 1 - board.moves as i32) / 2;
         if max_possible <= 0 {
-            return 0; // Can't win anymore, guaranteed draw at best
+            return 0;
         }
         if beta > max_possible {
             beta = max_possible;
@@ -104,7 +124,6 @@ impl Solver {
         if opponent_win != 0 {
             // Count opponent winning moves — if more than 1, we lose
             if (opponent_win & (opponent_win - 1)) != 0 {
-                // Multiple threats, we can only block one
                 return -(((COLS * ROWS) as i32 - board.moves as i32) / 2);
             }
             // Exactly one threat — we must play there (forced move)
@@ -122,15 +141,32 @@ impl Solver {
             }
         }
 
-        // Transposition table lookup
+        // Transposition table lookup with proper bound handling
         let key = board.key();
-        if let Some(stored) = self.table.get(key) {
-            let val = stored as i32 - 18; // offset decoding
-            if val >= beta {
-                return val;
+        let original_alpha = alpha;
+        if let Some((stored_raw, bound)) = self.table.get(key) {
+            let val = stored_raw as i32 - 18;
+            match bound {
+                Bound::Exact => return val,
+                Bound::Lower => {
+                    if val >= beta {
+                        return val;
+                    }
+                    if val > alpha {
+                        alpha = val;
+                    }
+                }
+                Bound::Upper => {
+                    if val <= alpha {
+                        return val;
+                    }
+                    if val < beta {
+                        beta = val;
+                    }
+                }
             }
-            if val > alpha {
-                alpha = val;
+            if alpha >= beta {
+                return val;
             }
         }
 
@@ -142,10 +178,6 @@ impl Solver {
             }
 
             board.play(col);
-
-            // Check if this move lets opponent win immediately — skip if so
-            // (already handled by forced move logic above, but this is for non-forced cases)
-
             let score = -self.negamax(board, -beta, -alpha);
             board.undo(col);
 
@@ -154,7 +186,7 @@ impl Solver {
             }
 
             if score >= beta {
-                self.table.put(key, (score + 18) as i8);
+                self.table.put(key, (score + 18) as i8, Bound::Lower);
                 return score;
             }
 
@@ -164,21 +196,28 @@ impl Solver {
         }
 
         if best == i32::MIN {
-            // No legal moves (shouldn't happen if is_full check is correct)
             return 0;
         }
 
-        self.table.put(key, (alpha + 18) as i8);
+        // Determine bound type for storage
+        let bound = if alpha > original_alpha {
+            Bound::Exact
+        } else {
+            Bound::Upper
+        };
+        self.table.put(key, (alpha + 18) as i8, bound);
         alpha
     }
 
     /// Returns a Vec of (col, score) pairs for all legal moves, sorted best to worst.
+    /// Also accumulates total node_count across all column solves.
     pub fn rank_moves(&mut self, board: &mut Board) -> Vec<(u32, i32)> {
         // If game is already over, return empty
         if board.is_win(board.opponent_board()) || board.is_full() {
             return vec![];
         }
 
+        self.node_count = 0;
         let mut results = vec![];
         for &col in &MOVE_ORDER {
             if board.height(col) >= ROWS {
@@ -209,25 +248,34 @@ mod tests {
     #[test]
     fn test_solve_immediate_win() {
         let mut solver = Solver::new();
-        // P1: 0, P2: 1, P1: 0, P2: 1, P1: 0, P2: 1 → P1 has 3 in col 0, can win
         let mut board = board_from_moves(&[0, 1, 0, 1, 0, 1]);
         let score = solver.solve(&mut board);
         assert!(score > 0, "P1 should be winning, got {}", score);
+        assert_eq!(score, 18, "Should be max win score (immediate win)");
     }
 
     #[test]
     fn test_solve_opponent_wins_next() {
         let mut solver = Solver::new();
-        // After these moves, P2 has 3 in col 1 and can win
         let mut board = board_from_moves(&[0, 1, 0, 1, 0, 1, 6]);
         let score = solver.solve(&mut board);
         assert!(score > 0, "P2 (current) should be winning, got {}", score);
+        assert_eq!(score, 18, "Should be max win score (can win immediately)");
+    }
+
+    #[test]
+    fn test_solve_terminal_position() {
+        let mut solver = Solver::new();
+        // P1 wins with 4 in col 0
+        let mut board = board_from_moves(&[0, 1, 0, 1, 0, 1, 0]);
+        // Game is over, P2 to move but P1 already won
+        let score = solver.solve(&mut board);
+        assert!(score < 0, "Current player (P2) should be losing, got {}", score);
     }
 
     #[test]
     fn test_solve_near_full_board() {
         let mut solver = Solver::new();
-        // Fill most of the board (36 moves, alternating col pairs)
         let moves = [
             0, 1, 0, 1, 0, 1,
             2, 3, 2, 3, 2, 3,
@@ -250,7 +298,6 @@ mod tests {
     #[test]
     fn test_rank_moves_near_full() {
         let mut solver = Solver::new();
-        // Use a near-full board where only col 6 has space and solutions are trivial
         let moves = [
             0, 1, 0, 1, 0, 1,
             2, 3, 2, 3, 2, 3,
@@ -267,18 +314,72 @@ mod tests {
         if board.is_game_over() { return; }
         let ranked = solver.rank_moves(&mut board);
         assert!(!ranked.is_empty());
-        // Verify sorted descending
         for i in 1..ranked.len() {
             assert!(ranked[i - 1].1 >= ranked[i].1);
         }
     }
 
     #[test]
-    fn test_transposition_table() {
+    fn test_rank_moves_node_count_accumulates() {
+        let mut solver = Solver::new();
+        let moves = [
+            0, 1, 0, 1, 0, 1,
+            2, 3, 2, 3, 2, 3,
+            4, 5, 4, 5, 4, 5,
+            1, 0, 1, 0, 1, 0,
+            3, 2, 3, 2, 3, 2,
+            5, 4, 5, 4, 5, 4,
+        ];
+        let mut board = Board::new();
+        for &col in &moves {
+            if board.is_game_over() { break; }
+            board.play(col);
+        }
+        if board.is_game_over() { return; }
+        solver.rank_moves(&mut board);
+        // Node count should be > 1 (accumulated across all column solves)
+        assert!(solver.node_count > 1, "Node count should accumulate, got {}", solver.node_count);
+    }
+
+    #[test]
+    fn test_self_consistency() {
+        let mut solver = Solver::new();
+        // Solve parent position
+        let mut parent = board_from_moves(&[0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6]);
+        let ranked = solver.rank_moves(&mut parent);
+        if ranked.is_empty() { return; }
+        let (best_col, parent_score) = ranked[0];
+
+        // Solve child position (after playing best move)
+        parent.play(best_col);
+        let child_score = solver.solve(&mut parent);
+
+        // Parent's best score should equal negation of child's score
+        assert_eq!(parent_score, -child_score,
+            "Self-consistency failed: parent best={} but -child={}",
+            parent_score, -child_score);
+    }
+
+    #[test]
+    fn test_transposition_table_bounds() {
         let mut tt = TranspositionTable::new(1024);
         assert!(tt.get(42).is_none());
-        tt.put(42, 25); // score = 25 - 18 = 7
-        assert_eq!(tt.get(42), Some(25));
+
+        tt.put(42, 25, Bound::Exact);
+        let (val, bound) = tt.get(42).unwrap();
+        assert_eq!(val, 25);
+        assert_eq!(bound, Bound::Exact);
+
+        tt.put(42, 20, Bound::Lower);
+        let (val, bound) = tt.get(42).unwrap();
+        assert_eq!(val, 20);
+        assert_eq!(bound, Bound::Lower);
+
+        tt.put(42, 15, Bound::Upper);
+        let (val, bound) = tt.get(42).unwrap();
+        assert_eq!(val, 15);
+        assert_eq!(bound, Bound::Upper);
+
         tt.reset();
         assert!(tt.get(42).is_none());
     }
