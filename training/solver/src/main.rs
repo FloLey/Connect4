@@ -45,6 +45,9 @@ enum GenerateMode {
     Systematic {
         #[arg(long, default_value = "10")]
         max_depth: u32,
+        /// Minimum depth to start solving (skip expensive early positions)
+        #[arg(long, default_value = "0")]
+        min_depth: u32,
         #[arg(long, default_value = "output")]
         output: String,
     },
@@ -63,6 +66,9 @@ enum GenerateMode {
         output: String,
         #[arg(long)]
         seed: Option<u64>,
+        /// Minimum depth to start solving in systematic phase (default: 0 = solve all)
+        #[arg(long, default_value = "0")]
+        min_depth: u32,
     },
 }
 
@@ -163,11 +169,9 @@ fn cmd_solve(move_sequence: &str) {
 
 fn cmd_generate(mode: GenerateMode) {
     match mode {
-        GenerateMode::Systematic { max_depth, output } => {
+        GenerateMode::Systematic { max_depth, min_depth, output } => {
             let start = Instant::now();
-            // Use min_solve_depth=8 to skip expensive early positions
-            let min_solve = max_depth.min(8);
-            let (data, _seen) = generate_systematic(max_depth, min_solve);
+            let (data, _seen) = generate_systematic(max_depth, min_depth);
             let path = Path::new(&output).join(format!("systematic_d{}.csv", max_depth));
             write_csv(&path, &data).expect("Failed to write CSV");
             println!(
@@ -213,12 +217,12 @@ fn cmd_generate(mode: GenerateMode) {
                 start.elapsed()
             );
         }
-        GenerateMode::Full { output, seed } => {
+        GenerateMode::Full { output, seed, min_depth } => {
             let start = Instant::now();
 
-            // Systematic: depth <= 10, solving from depth 8+
-            eprintln!("=== Phase 1: Systematic generation (depth <= 10, solving >= 8) ===");
-            let (systematic, mut seen) = generate_systematic(10, 8);
+            // Systematic: depth <= 10
+            eprintln!("=== Phase 1: Systematic generation (depth <= 10, solving >= {}) ===", min_depth);
+            let (systematic, mut seen) = generate_systematic(10, min_depth);
             let path = Path::new(&output).join("systematic_d10.csv");
             write_csv(&path, &systematic).expect("Failed to write CSV");
             println!(
