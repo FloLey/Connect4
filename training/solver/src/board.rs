@@ -73,8 +73,9 @@ impl Board {
         self.move_history.push(col);
     }
 
-    /// Undo the last move in column `col`.
-    pub fn undo(&mut self, col: u32) {
+    /// Undo the last move. Uses move_history to determine which column.
+    pub fn undo(&mut self) {
+        let col = self.move_history.pop().expect("Cannot undo from empty move history");
         let h = self.height(col);
         assert!(h > 0, "Column {} is empty, cannot undo", col);
 
@@ -82,7 +83,6 @@ impl Board {
         self.mask ^= bit;
         self.position ^= self.mask;
         self.moves -= 1;
-        self.move_history.pop();
     }
 
     /// Returns true if the given bitboard contains a four-in-a-row.
@@ -292,7 +292,7 @@ mod tests {
         b.play(2);
         let key_before = b.key();
         b.play(4);
-        b.undo(4);
+        b.undo();
         assert_eq!(b.key(), key_before);
         assert_eq!(b.moves, 2);
     }
@@ -338,6 +338,24 @@ mod tests {
     fn test_is_full() {
         let b = Board::new();
         assert!(!b.is_full());
+
+        // Fill the board with a pattern that avoids 4-in-a-row
+        // (alternating pairs per column, reverse order for upper half)
+        let mut full = Board::new();
+        let moves = [
+            0, 1, 0, 1, 0, 1,
+            2, 3, 2, 3, 2, 3,
+            4, 5, 4, 5, 4, 5,
+            1, 0, 1, 0, 1, 0,
+            3, 2, 3, 2, 3, 2,
+            5, 4, 5, 4, 5, 4,
+            6, 6, 6, 6, 6, 6,
+        ];
+        for &col in &moves {
+            if full.is_game_over() { break; }
+            full.play(col);
+        }
+        assert!(full.is_full() || full.is_game_over());
     }
 
     #[test]
@@ -378,21 +396,23 @@ mod tests {
 
     #[test]
     fn test_non_losing_moves_excludes_below_opponent_win() {
+        // Build a position where P2 has 3 horizontal on row 0 (cols 3,4,5)
+        // and threatens col 2 at row 0 and col 6 at row 0.
+        // Playing col 2 or col 6 at row 0 should be allowed (it blocks/doesn't
+        // create a threat above). But if P2 threatened at row 1, playing at
+        // row 0 in that column would give P2 row 1 — that should be excluded.
         let mut b = Board::new();
-        // Build a position where opponent threatens horizontally at row 1,
-        // and playing in a column at row 0 would give them the cell at row 1.
-        // P1: cols 0,1 at row 0. P2: cols 3,4,5 at row 0 (3 horizontal).
-        // P2 threatens col 2 row 0 and col 6 row 0.
         b.play(0); b.play(3); b.play(1); b.play(4); b.play(6); b.play(5);
-        // P1 has: cols 0,1,6 at row 0. P2 has: cols 3,4,5 at row 0.
-        // P2 threatens col 2 (horizontal completion) and col 6... no.
-        // Actually let me just verify the function doesn't crash and returns a subset of legal.
+        // P1 to move. P2 has 3 horizontal (cols 3,4,5 row 0).
+        // P2's winning cells: col 2 row 0 (extends left) and col 6 row 0 (extends right).
+        // But col 6 already has P1's piece at row 0, so only col 2 row 0 is a threat.
         let nlm = b.non_losing_moves();
         let legal = b.legal_moves_mask();
-        // Non-losing moves should be a subset of legal moves
+        // Non-losing moves must be subset of legal
         assert_eq!(nlm & !legal, 0, "non_losing_moves should be subset of legal_moves");
-        // And should not be empty (there must be some safe move)
-        assert_ne!(nlm, 0, "Should have at least one non-losing move");
+        // Since P2 threatens col 2 row 0 (a legal cell), this is a forced blocking move
+        let forced_bit = 1u64 << bit_index(2, 0);
+        assert_ne!(nlm & forced_bit, 0, "Must include the forced blocking move at col 2");
     }
 
     #[test]
