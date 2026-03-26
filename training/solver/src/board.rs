@@ -2,6 +2,29 @@ pub const COLS: u32 = 7;
 pub const ROWS: u32 = 6;
 pub const STRIDE: u32 = 7; // bits per column (6 rows + 1 sentinel)
 
+/// Bottom bit of each column (row 0).
+const BOTTOM_MASK: u64 = {
+    let mut m = 0u64;
+    let mut c = 0u32;
+    while c < COLS {
+        m |= 1u64 << (c * STRIDE);
+        c += 1;
+    }
+    m
+};
+
+/// All playable bits (rows 0 through ROWS-1 of each column).
+const BOARD_MASK: u64 = {
+    let col_mask = (1u64 << ROWS) - 1; // 0b111111
+    let mut m = 0u64;
+    let mut c = 0u32;
+    while c < COLS {
+        m |= col_mask << (c * STRIDE);
+        c += 1;
+    }
+    m
+};
+
 /// Returns the bit index for a given column and row.
 pub fn bit_index(col: u32, row: u32) -> u32 {
     col * STRIDE + row
@@ -104,15 +127,10 @@ impl Board {
     }
 
     /// Returns a bitmask of all cells that are legal next moves.
+    /// Uses the bottom-mask trick: adding BOTTOM_MASK to mask carries through
+    /// consecutive 1s to land on the first empty row in each column.
     pub fn legal_moves_mask(&self) -> u64 {
-        let mut result = 0u64;
-        for col in 0..COLS {
-            let h = self.height(col);
-            if h < ROWS {
-                result |= 1u64 << bit_index(col, h);
-            }
-        }
-        result
+        (self.mask + BOTTOM_MASK) & BOARD_MASK
     }
 
     /// Returns the unique key for this position (used in transposition table).
@@ -162,6 +180,43 @@ impl Board {
         let h = self.height(col);
         let bit = 1u64 << bit_index(col, h);
         Self::compute_winning_positions(self.position | bit).count_ones()
+    }
+
+    /// Check if the current player can create a double threat (2+ winning positions
+    /// on immediately playable cells) with any single move.
+    /// Uses O(1) bitwise legal_moves computation via bottom-mask trick.
+    pub fn can_create_double_threat(&self) -> bool {
+        let opponent_wins = Self::compute_winning_positions(self.mask ^ self.position);
+
+        for col in 0..COLS {
+            let h = self.height(col);
+            if h >= ROWS {
+                continue;
+            }
+            let bit = 1u64 << bit_index(col, h);
+
+            // Skip if this move gives the OTHER player a win directly above
+            if h + 1 < ROWS && opponent_wins & (bit << 1) != 0 {
+                continue;
+            }
+
+            // Simulate playing this move
+            let new_pos = self.position | bit;
+            let new_mask = self.mask | bit;
+
+            // Winning positions after this move
+            let wins = Self::compute_winning_positions(new_pos);
+
+            // Legal cells after this move (O(1) via bottom-mask trick)
+            let legal_after = (new_mask + BOTTOM_MASK) & BOARD_MASK;
+
+            // Count playable threats
+            let playable_threats = (wins & legal_after).count_ones();
+            if playable_threats >= 2 {
+                return true;
+            }
+        }
+        false
     }
 
     /// Compute all cells where placing a piece would complete a four-in-a-row
