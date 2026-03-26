@@ -306,7 +306,12 @@ fn cmd_bench() {
         solver.solve(&mut board);
         total_nodes += solver.node_count;
         solved += 1;
+
+        if solved % 100 == 0 || solved == 1000 {
+            eprint!("\rSolving... {} / 1000 positions  ", solved);
+        }
     }
+    eprintln!();
 
     let elapsed = start.elapsed();
     let positions_per_sec = 1000.0 / elapsed.as_secs_f64();

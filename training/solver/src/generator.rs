@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -61,6 +63,41 @@ impl DataPoint {
     }
 }
 
+fn solve_boards_with_progress(boards: &[Board]) -> Vec<DataPoint> {
+    let done = AtomicUsize::new(0);
+    let total = boards.len();
+    let start = Instant::now();
+
+    let results: Vec<DataPoint> = boards
+        .par_iter()
+        .filter_map(|b| {
+            let result = DataPoint::from_board_thread_local(b);
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 1000 == 0 || n == total {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = n as f64 / elapsed;
+                let eta = (total - n) as f64 / rate;
+                eprint!(
+                    "\rSolving... {} / {} ({:.1}%) [depth ~{}] [{:.0} pos/sec, ETA: {}]  ",
+                    n, total, 100.0 * n as f64 / total as f64, b.moves, rate, fmt_eta(eta)
+                );
+            }
+            result
+        })
+        .collect();
+    eprintln!();
+    results
+}
+
+fn fmt_eta(secs: f64) -> String {
+    let s = secs as u64;
+    if s >= 60 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{}s", s)
+    }
+}
+
 /// Write a batch of DataPoints to a CSV file.
 pub fn write_csv(path: &Path, data: &[DataPoint]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -116,16 +153,12 @@ pub fn generate_systematic(
         seen.len()
     );
 
-    // Phase 2: Solve in parallel using rayon
-    let results: Vec<DataPoint> = boards
-        .par_iter()
-        .filter_map(|b| DataPoint::from_board_thread_local(b))
-        .collect();
+    // Sort deepest positions first: warm TT with easy positions before hard shallow ones
+    boards.sort_unstable_by_key(|b| std::cmp::Reverse(b.moves));
 
-    eprintln!(
-        "Systematic generation complete: {} positions solved",
-        results.len()
-    );
+    // Phase 2: Solve in parallel — each thread has its own 160MB TT
+    let results = solve_boards_with_progress(&boards);
+
     (results, seen)
 }
 
@@ -183,11 +216,8 @@ pub fn generate_random(
 
     // Phase 1: Generate board positions (sequential, cheap)
     let mut boards: Vec<Board> = Vec::with_capacity(count);
-    let mut attempts = 0u64;
 
     while boards.len() < count {
-        attempts += 1;
-
         // Random depth between 8 and 36
         let target_depth: u32 = rng.gen_range(8..=36);
         let mut board = Board::new();
@@ -220,33 +250,17 @@ pub fn generate_random(
 
         boards.push(board);
 
-        if boards.len() % 10000 == 0 {
-            eprintln!(
-                "  ... {}/{} positions generated ({} attempts)",
-                boards.len(),
-                count,
-                attempts
+        if boards.len() % 10000 == 0 || boards.len() == count {
+            eprint!(
+                "\rGenerating... {} / {} ({:.1}%)   ",
+                boards.len(), count, 100.0 * boards.len() as f64 / count as f64
             );
         }
     }
+    eprintln!();
 
-    eprintln!(
-        "Generated {} positions in {} attempts, solving in parallel...",
-        boards.len(),
-        attempts
-    );
-
-    // Phase 2: Solve in parallel using rayon
-    let results: Vec<DataPoint> = boards
-        .par_iter()
-        .filter_map(|b| DataPoint::from_board_thread_local(b))
-        .collect();
-
-    eprintln!(
-        "Random generation complete: {} positions solved",
-        results.len()
-    );
-    results
+    // Phase 2: Solve in parallel — each thread has its own 160MB TT
+    solve_boards_with_progress(&boards)
 }
 
 #[cfg(test)]
