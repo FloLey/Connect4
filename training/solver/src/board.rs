@@ -35,7 +35,8 @@ pub struct Board {
     pub position: u64, // bitmask for current player's pieces
     pub mask: u64,     // bitmask for ALL pieces (both players)
     pub moves: u32,    // number of moves played so far
-    move_history: Vec<u32>,
+    move_history: [u32; 42],
+    history_len: usize,
 }
 
 impl Board {
@@ -44,12 +45,14 @@ impl Board {
             position: 0,
             mask: 0,
             moves: 0,
-            move_history: Vec::with_capacity(42),
+            move_history: [0u32; 42],
+            history_len: 0,
         }
     }
 
     /// Returns the height (0..=6) of a given column.
     /// Height 6 means full (no legal move).
+    #[inline(always)]
     pub fn height(&self, col: u32) -> u32 {
         let bottom = col * STRIDE;
         let col_mask = self.mask >> bottom;
@@ -70,12 +73,15 @@ impl Board {
         self.position ^= self.mask;
         self.mask |= bit;
         self.moves += 1;
-        self.move_history.push(col);
+        self.move_history[self.history_len] = col;
+        self.history_len += 1;
     }
 
     /// Undo the last move. Uses move_history to determine which column.
     pub fn undo(&mut self) {
-        let col = self.move_history.pop().expect("Cannot undo from empty move history");
+        assert!(self.history_len > 0, "Cannot undo from empty move history");
+        self.history_len -= 1;
+        let col = self.move_history[self.history_len];
         let h = self.height(col);
         assert!(h > 0, "Column {} is empty, cannot undo", col);
 
@@ -86,6 +92,7 @@ impl Board {
     }
 
     /// Returns true if the given bitboard contains a four-in-a-row.
+    #[inline(always)]
     pub fn is_win(&self, board: u64) -> bool {
         let mut m: u64;
         // Horizontal (stride = 7)
@@ -112,16 +119,19 @@ impl Board {
     }
 
     /// Returns the bitboard of the opponent (the player who just moved).
+    #[inline(always)]
     pub fn opponent_board(&self) -> u64 {
         self.mask ^ self.position
     }
 
     /// Returns a bitmask of all cells where the current player can win immediately.
+    #[inline(always)]
     pub fn winning_moves(&self) -> u64 {
         Self::compute_winning_positions(self.position) & self.legal_moves_mask()
     }
 
     /// Returns a bitmask of all cells where the opponent could win if it were their turn.
+    #[cfg(test)]
     pub fn opponent_winning_moves(&self) -> u64 {
         Self::compute_winning_positions(self.mask ^ self.position) & self.legal_moves_mask()
     }
@@ -129,19 +139,21 @@ impl Board {
     /// Returns a bitmask of all cells that are legal next moves.
     /// Uses the bottom-mask trick: adding BOTTOM_MASK to mask carries through
     /// consecutive 1s to land on the first empty row in each column.
+    #[inline(always)]
     pub fn legal_moves_mask(&self) -> u64 {
         (self.mask + BOTTOM_MASK) & BOARD_MASK
     }
 
     /// Returns the unique key for this position (used in transposition table).
     /// key = position + mask (provably unique for all reachable positions)
+    #[inline(always)]
     pub fn key(&self) -> u64 {
         self.position.wrapping_add(self.mask)
     }
 
     /// Returns the move sequence as a string of column digits (0-indexed).
     pub fn move_sequence(&self) -> String {
-        self.move_history.iter().map(|c| char::from(b'0' + *c as u8)).collect()
+        self.move_history[..self.history_len].iter().map(|c| char::from(b'0' + *c as u8)).collect()
     }
 
     /// Returns true if the board is completely full (draw).
@@ -158,6 +170,8 @@ impl Board {
     /// Returns a bitmask of legal moves that don't give the opponent an immediate win.
     /// Excludes moves that play directly below an opponent winning cell.
     /// If forced to block (opponent has a threat on a legal cell), returns only the blocking move(s).
+    #[allow(dead_code)]
+    #[inline(always)]
     pub fn non_losing_moves(&self) -> u64 {
         let possible = self.legal_moves_mask();
         // CRITICAL: mask to empty board cells only — prevents phantom bits
@@ -188,46 +202,38 @@ impl Board {
         Self::compute_winning_positions(self.position | bit).count_ones()
     }
 
-    /// Check if the current player can create a double threat (2+ winning positions
-    /// on immediately playable cells) with any single move.
-    /// Uses O(1) bitwise legal_moves computation via bottom-mask trick.
-    pub fn can_create_double_threat(&self) -> bool {
-        let opponent_wins = Self::compute_winning_positions(self.mask ^ self.position);
+    /// Pre-compute (legal_moves, winning_positions_current, winning_positions_opponent) in one pass.
+    /// Called once per negamax node to avoid redundant compute_winning_positions calls.
+    #[inline(always)]
+    pub fn precompute_threats(&self) -> (u64, u64, u64) {
+        let legal = (self.mask + BOTTOM_MASK) & BOARD_MASK;
+        let winning_cur = Self::compute_winning_positions(self.position);
+        let winning_opp = Self::compute_winning_positions(self.mask ^ self.position);
+        (legal, winning_cur, winning_opp)
+    }
 
-        for col in 0..COLS {
-            let h = self.height(col);
-            if h >= ROWS {
-                continue;
-            }
-            let bit = 1u64 << bit_index(col, h);
+    /// winning_moves using pre-computed values from precompute_threats().
+    #[inline(always)]
+    pub fn winning_moves_with(&self, winning_cur: u64, legal: u64) -> u64 {
+        winning_cur & legal
+    }
 
-            // Skip if this move gives the OTHER player a win directly above
-            if h + 1 < ROWS && opponent_wins & (bit << 1) != 0 {
-                continue;
-            }
-
-            // Simulate playing this move
-            let new_pos = self.position | bit;
-            let new_mask = self.mask | bit;
-
-            // Winning positions after this move
-            let wins = Self::compute_winning_positions(new_pos);
-
-            // Legal cells after this move (O(1) via bottom-mask trick)
-            let legal_after = (new_mask + BOTTOM_MASK) & BOARD_MASK;
-
-            // Count playable threats
-            let playable_threats = (wins & legal_after).count_ones();
-            if playable_threats >= 2 {
-                return true;
-            }
+    /// non_losing_moves using pre-computed opponent winning positions from precompute_threats().
+    #[inline(always)]
+    pub fn non_losing_moves_with(&self, legal: u64, winning_opp: u64) -> u64 {
+        let opponent_wins = winning_opp & (BOARD_MASK & !self.mask);
+        let forced = opponent_wins & legal;
+        if forced != 0 {
+            if forced & (forced - 1) != 0 { return 0; }
+            return forced & !(opponent_wins >> 1);
         }
-        false
+        legal & !(opponent_wins >> 1)
     }
 
     /// Compute all cells where placing a piece would complete a four-in-a-row
     /// for the given player. Uses Pascal Pons' method: for each direction,
     /// enumerate all 4 gap patterns (XXX_, _XXX, XX_X, X_XX).
+    #[inline(always)]
     fn compute_winning_positions(pos: u64) -> u64 {
         let mut r = 0u64;
 

@@ -10,41 +10,42 @@ const MAX_SCORE: i32 = ((COLS * ROWS) as i32 + 1) / 2 - 3; // 18
 /// - Upper bound stored as: alpha - MIN_SCORE + 1 (range 1..37)
 /// - Lower bound stored as: score + MAX_SCORE - 2*MIN_SCORE + 2 (range 38..74)
 /// - 0 = empty
-/// Uses u32 partial keys (truncated from u64) to save memory.
+/// Uses u32 partial keys and power-of-two size for O(1) bitwise indexing.
 pub struct TranspositionTable {
     keys: Vec<u32>,
     values: Vec<u8>,
-    size: usize,
+    mask: usize, // size - 1; size must be a power of two
 }
 
 impl TranspositionTable {
     pub fn new(size: usize) -> Self {
+        debug_assert!(size.is_power_of_two(), "TT size must be a power of two");
         TranspositionTable {
-            keys: vec![0; size],
-            values: vec![0; size],
-            size,
+            keys: vec![0u32; size],
+            values: vec![0u8; size],
+            mask: size - 1,
         }
     }
 
+    #[inline(always)]
     fn index(&self, key: u64) -> usize {
-        (key as usize) % self.size
+        (key as usize) & self.mask
     }
 
+    #[inline(always)]
     pub fn get(&self, key: u64) -> u8 {
         let idx = self.index(key);
-        if self.keys[idx] == key as u32 {
-            self.values[idx]
-        } else {
-            0
-        }
+        if self.keys[idx] == key as u32 { self.values[idx] } else { 0 }
     }
 
+    #[inline(always)]
     pub fn put(&mut self, key: u64, value: u8) {
         let idx = self.index(key);
         self.keys[idx] = key as u32;
         self.values[idx] = value;
     }
 
+    #[cfg(test)]
     pub fn reset(&mut self) {
         self.keys.fill(0);
         self.values.fill(0);
@@ -59,8 +60,8 @@ pub struct Solver {
 impl Solver {
     pub fn new() -> Self {
         Solver {
-            // ~8.4M entries * 5 bytes = ~42MB, fits near L3 cache
-            table: TranspositionTable::new(8_388_593), // ~8.4M entries, ~42MB (L3 cache friendly)
+            // 2^25 = 33,554,432 entries × 5 bytes = ~160MB per thread
+            table: TranspositionTable::new(1 << 25),
             node_count: 0,
         }
     }
@@ -119,7 +120,10 @@ impl Solver {
             return 0;
         }
 
-        if board.winning_moves() != 0 {
+        // Pre-compute legal moves, current and opponent winning positions once per node
+        let (legal, winning_cur, winning_opp) = board.precompute_threats();
+
+        if board.winning_moves_with(winning_cur, legal) != 0 {
             return ((COLS * ROWS) as i32 + 1 - board.moves as i32) / 2;
         }
 
@@ -134,7 +138,7 @@ impl Solver {
             }
         }
 
-        let non_losing = board.non_losing_moves();
+        let non_losing = board.non_losing_moves_with(legal, winning_opp);
         if non_losing == 0 {
             return -(((COLS * ROWS) as i32 - board.moves as i32) / 2);
         }
