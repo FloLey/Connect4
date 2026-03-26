@@ -1,7 +1,8 @@
 """
 Connect Four LLM Training Pipeline — SFT + GRPO with Unsloth
 Usage:
-  python connect4_train.py --model {4b,8b,14b} --stage {sft,grpo,both,eval,export} --csv connect4_data.csv
+  python connect4_train.py --model {4b,8b,14b} --stage {sft,grpo,both,eval,export,push} --csv connect4_data.csv
+  python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
 """
 
 import argparse, csv, json, os, re, random
@@ -14,6 +15,12 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+try:
+    from huggingface_hub import HfApi, create_repo
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
 
 MODEL_CONFIGS = {
     "4b": {"model_name": "unsloth/Qwen3-4B", "lora_r": 32, "grpo_num_generations": 6, "grpo_batch_size": 4, "grpo_grad_accum": 2, "sft_batch_size": 8},
@@ -203,20 +210,54 @@ def export_model(config):
     model.save_pretrained_gguf(config["final_model"]+"-gguf", tokenizer, quantization_method="q4_k_m")
     print(f"Exported to {config['final_model']} and {config['final_model']}-gguf")
 
+def push_to_hub(config):
+    if not HF_AVAILABLE:
+        print("ERROR: huggingface_hub not installed. Run: pip install huggingface_hub")
+        return
+    from huggingface_hub import HfApi, create_repo
+    hf_repo = config.get("hf_repo")
+    if not hf_repo:
+        print("ERROR: --hf-repo is required for push stage (e.g. yourname/connect4-agent-8b)")
+        return
+    api = HfApi()
+    size = config["model_size"]
+    merged_dir = config["final_model"]
+    gguf_dir = config["final_model"] + "-gguf"
+    # Push merged 16-bit model
+    if os.path.exists(merged_dir):
+        repo_id = hf_repo
+        print(f"\nPushing merged model to https://huggingface.co/{repo_id}")
+        create_repo(repo_id, exist_ok=True)
+        api.upload_folder(folder_path=merged_dir, repo_id=repo_id, commit_message=f"Upload Connect4 agent ({size}) — merged 16-bit")
+        print(f"  -> https://huggingface.co/{repo_id}")
+    else:
+        print(f"WARNING: {merged_dir}/ not found — run --stage export first")
+    # Push GGUF to a separate repo (or same repo with subfolder)
+    if os.path.exists(gguf_dir):
+        gguf_repo = hf_repo + "-GGUF"
+        print(f"\nPushing GGUF to https://huggingface.co/{gguf_repo}")
+        create_repo(gguf_repo, exist_ok=True)
+        api.upload_folder(folder_path=gguf_dir, repo_id=gguf_repo, commit_message=f"Upload Connect4 agent ({size}) — GGUF q4_k_m")
+        print(f"  -> https://huggingface.co/{gguf_repo}")
+    else:
+        print(f"WARNING: {gguf_dir}/ not found — run --stage export first")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["4b","8b","14b"], required=True)
-    parser.add_argument("--stage", choices=["sft","grpo","both","eval","export"], default="both")
+    parser.add_argument("--stage", choices=["sft","grpo","both","eval","export","push"], default="both")
     parser.add_argument("--csv", default="connect4_data.csv")
+    parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
     if args.no_wandb: global WANDB_AVAILABLE; WANDB_AVAILABLE = False
-    config = get_config(args.model); config["csv_path"] = args.csv
+    config = get_config(args.model); config["csv_path"] = args.csv; config["hf_repo"] = args.hf_repo
     print(f"\nConnect Four Pipeline | Model: {config['model_name']} | Stage: {args.stage} | Wandb: {'on' if WANDB_AVAILABLE else 'off'}")
     if args.stage in ("sft","both"): run_sft(config)
     if args.stage in ("grpo","both"): run_grpo(config)
     if args.stage == "eval": run_eval(config)
     if args.stage == "export": export_model(config)
+    if args.stage == "push": push_to_hub(config)
 
 if __name__ == "__main__":
     main()
