@@ -25,3 +25,4 @@ yarn-error.log*
 .env
 .dump_config.json
 codebase_dump.txt
+training/solver/target/
