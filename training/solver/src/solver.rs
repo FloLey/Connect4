@@ -194,7 +194,7 @@ impl Solver {
             let col = move_entries[i].0;
             board.play(col);
             let score = -self.negamax(board, -beta, -alpha);
-            board.undo(col);
+            board.undo();
 
             if score >= beta {
                 // Store lower bound
@@ -228,7 +228,7 @@ impl Solver {
             }
             board.play(col);
             let score = -self.solve(board);
-            board.undo(col);
+            board.undo();
             results.push((col, score));
         }
         results.sort_by(|a, b| b.1.cmp(&a.1));

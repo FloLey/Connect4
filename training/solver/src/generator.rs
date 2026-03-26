@@ -167,7 +167,7 @@ fn systematic_collect(
             systematic_collect(board, max_depth, min_solve_depth, seen, boards);
         }
 
-        board.undo(col);
+        board.undo();
     }
 }
 

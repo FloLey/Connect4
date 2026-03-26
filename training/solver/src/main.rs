@@ -107,8 +107,8 @@ fn cmd_solve(move_sequence: &str) {
     if board.is_win(board.opponent_board()) {
         let elapsed = start.elapsed();
         let score = solver.solve(&mut board);
-        println!("Game is already over. The player who just moved WON.");
-        println!("Score: {} (from current player's perspective)", score);
+        println!("Game is already over. The player who just moved WON, meaning the current player LOST.");
+        println!("Score: {} (current player's loss)", score);
         println!("Time: {:.2?}", elapsed);
         return;
     }
