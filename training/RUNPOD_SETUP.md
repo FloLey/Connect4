@@ -28,10 +28,13 @@ On **each pod**, run:
 
 ```bash
 # Install dependencies
-pip install unsloth wandb diffusers
+pip install unsloth wandb diffusers huggingface_hub
 
 # Login to wandb (paste your API key when prompted)
 wandb login
+
+# Login to HuggingFace (paste your token when prompted)
+huggingface-cli login
 
 # Upload your files (or git clone your repo)
 # Make sure these are in the working directory:
@@ -125,6 +128,31 @@ python connect4_train.py --model {4b,8b,14b} --stage export --csv connect4_data.
 This creates:
 - `connect4-agent-{size}/` — merged HuggingFace model (16-bit)
 - `connect4-agent-{size}-gguf/` — quantized GGUF (q4_k_m) for llama.cpp / Ollama
+
+---
+
+## Step 6: Push to HuggingFace
+
+After exporting, push to HuggingFace Hub so you can reuse the model anywhere:
+
+```bash
+python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
+```
+
+This uploads two repos:
+- `yourname/connect4-agent-8b` — the merged 16-bit model (use with `transformers` / vLLM)
+- `yourname/connect4-agent-8b-GGUF` — the quantized GGUF (use with llama.cpp / Ollama)
+
+To use later:
+```python
+# With transformers
+from transformers import AutoModelForCausalLM, AutoTokenizer
+model = AutoModelForCausalLM.from_pretrained("yourname/connect4-agent-8b")
+
+# With Ollama
+# Download the GGUF file from the -GGUF repo, then:
+# ollama create connect4 -f Modelfile
+```
 
 ---
 
