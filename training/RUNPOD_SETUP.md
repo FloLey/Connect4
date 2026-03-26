@@ -168,7 +168,7 @@ If you get CUDA OOM errors:
 
 - Lower temperature (try 0.5 instead of 0.7) — the model may be generating too randomly.
 - Increase `grpo_grad_accum` to 8 or 16 for more stable gradients.
-- Try switching to `loss_type="dr_grpo"` in the GRPOConfig (edit the script).
+- Try the DR-GRPO loss variant: `--loss-type dr_grpo`.
 - Make sure SFT completed successfully first — GRPO needs a good starting point.
 
 ### Pod disconnects mid-training

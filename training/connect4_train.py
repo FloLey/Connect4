@@ -5,8 +5,13 @@ Usage:
   python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
 """
 
-import argparse, csv, json, os, re, random
-from collections import defaultdict
+import argparse
+import csv
+import json
+import os
+import re
+import random
+
 import torch
 from datasets import Dataset
 
@@ -160,13 +165,15 @@ def run_grpo(config, train_data):
     run_name = f"grpo-{config['model_size']}"
     if WANDB_AVAILABLE:
         wandb.init(project=config["wandb_project"], name=run_name, tags=[config["model_size"],"grpo"], config={"model":config["model_name"],"stage":"grpo","num_generations":config["grpo_num_generations"],"temperature":config["grpo_temperature"]}, reinit=True)
+    grpo_kwargs = dict(output_dir=config["grpo_output"], temperature=config["grpo_temperature"], num_generations=config["grpo_num_generations"],
+        max_prompt_length=256, max_completion_length=256, learning_rate=config["grpo_learning_rate"],
+        per_device_train_batch_size=config["grpo_batch_size"], gradient_accumulation_steps=config["grpo_grad_accum"],
+        max_steps=config["grpo_max_steps"], weight_decay=0.01, warmup_ratio=0.05, lr_scheduler_type="cosine",
+        optim="adamw_8bit", logging_steps=1, save_steps=300, report_to="wandb" if WANDB_AVAILABLE else "none", run_name=run_name)
+    if config.get("grpo_loss_type"):
+        grpo_kwargs["loss_type"] = config["grpo_loss_type"]
     trainer = GRPOTrainer(model=model, processing_class=tokenizer, reward_funcs=[reward_calc.reward_format, reward_calc.reward_move_quality, reward_calc.reward_is_best_move],
-        args=GRPOConfig(output_dir=config["grpo_output"], temperature=config["grpo_temperature"], num_generations=config["grpo_num_generations"],
-            max_prompt_length=256, max_completion_length=256, learning_rate=config["grpo_learning_rate"],
-            per_device_train_batch_size=config["grpo_batch_size"], gradient_accumulation_steps=config["grpo_grad_accum"],
-            max_steps=config["grpo_max_steps"], weight_decay=0.01, warmup_ratio=0.05, lr_scheduler_type="cosine",
-            optim="adamw_8bit", logging_steps=1, save_steps=300, report_to="wandb" if WANDB_AVAILABLE else "none", run_name=run_name),
-        train_dataset=dataset)
+        args=GRPOConfig(**grpo_kwargs), train_dataset=dataset)
     print("\nStarting GRPO... Watch reward climb at https://wandb.ai -> connect4-llm")
     trainer.train()
     if WANDB_AVAILABLE: wandb.finish()
@@ -258,10 +265,16 @@ def main():
     parser.add_argument("--stage", choices=["sft","grpo","both","eval","export","push"], default="both")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
+    parser.add_argument("--loss-type", default=None, help="GRPO loss type (e.g. dr_grpo)")
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
-    if args.no_wandb: global WANDB_AVAILABLE; WANDB_AVAILABLE = False
-    config = get_config(args.model); config["csv_path"] = args.csv; config["hf_repo"] = args.hf_repo
+    if args.no_wandb:
+        global WANDB_AVAILABLE
+        WANDB_AVAILABLE = False
+    config = get_config(args.model)
+    config["csv_path"] = args.csv
+    config["hf_repo"] = args.hf_repo
+    config["grpo_loss_type"] = args.loss_type
     print(f"\nConnect Four Pipeline | Model: {config['model_name']} | Stage: {args.stage} | Wandb: {'on' if WANDB_AVAILABLE else 'off'}")
     train_data, eval_data = split_data(config["csv_path"])
     print(f"Data split: {len(train_data)} train, {len(eval_data)} eval (seed=42, no overlap)")
