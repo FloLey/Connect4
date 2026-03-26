@@ -160,12 +160,18 @@ impl Board {
     /// If forced to block (opponent has a threat on a legal cell), returns only the blocking move(s).
     pub fn non_losing_moves(&self) -> u64 {
         let possible = self.legal_moves_mask();
-        let opponent_wins = Self::compute_winning_positions(self.mask ^ self.position);
+        // CRITICAL: mask to empty board cells only — prevents phantom bits
+        // in sentinel rows from poisoning the >> 1 shift
+        let opponent_wins =
+            Self::compute_winning_positions(self.mask ^ self.position) & (BOARD_MASK & !self.mask);
         let forced = opponent_wins & possible;
 
         if forced != 0 {
-            // Must block. If multiple threats exist, caller should detect that separately.
-            // Filter forced moves to exclude any that enable another win above.
+            if forced & (forced - 1) != 0 {
+                // Multiple forced moves = double threat = we lose
+                return 0;
+            }
+            // Single forced move: must play there, but also filter below-threat cells
             return forced & !(opponent_wins >> 1);
         }
 
