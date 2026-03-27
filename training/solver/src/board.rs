@@ -151,6 +151,17 @@ impl Board {
         self.position.wrapping_add(self.mask)
     }
 
+    /// Returns a compact key encoding the first `n` moves, used to group positions
+    /// with the same opening prefix into the same thread chunk for TT locality.
+    pub fn prefix_key(&self, n: usize) -> u32 {
+        let depth = self.history_len.min(n);
+        let mut key = 0u32;
+        for i in 0..depth {
+            key = key * COLS + self.move_history[i];
+        }
+        key
+    }
+
     /// Returns the move sequence as a string of column digits (0-indexed).
     pub fn move_sequence(&self) -> String {
         self.move_history[..self.history_len].iter().map(|c| char::from(b'0' + *c as u8)).collect()

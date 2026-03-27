@@ -68,21 +68,29 @@ fn solve_boards_with_progress(boards: &[Board]) -> Vec<DataPoint> {
     let total = boards.len();
     let start = Instant::now();
 
+    // One chunk per thread: each thread processes a contiguous slice of the
+    // (DFS-ordered or prefix-sorted) boards array, so its TT accumulates
+    // sub-position results that are reused by subsequent positions in the chunk.
+    let n_threads = rayon::current_num_threads();
+    let chunk_size = (total + n_threads - 1) / n_threads;
+
     let results: Vec<DataPoint> = boards
-        .par_iter()
-        .filter_map(|b| {
-            let result = DataPoint::from_board_thread_local(b);
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 1000 == 0 || n == total {
-                let elapsed = start.elapsed().as_secs_f64();
-                let rate = n as f64 / elapsed;
-                let eta = (total - n) as f64 / rate;
-                eprint!(
-                    "\rSolving... {} / {} ({:.1}%) [depth ~{}] [{:.0} pos/sec, ETA: {}]  ",
-                    n, total, 100.0 * n as f64 / total as f64, b.moves, rate, fmt_eta(eta)
-                );
-            }
-            result
+        .par_chunks(chunk_size.max(1))
+        .flat_map_iter(|chunk| {
+            chunk.iter().filter_map(|b| {
+                let result = DataPoint::from_board_thread_local(b);
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 1000 == 0 || n == total {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let rate = n as f64 / elapsed;
+                    let eta = (total - n) as f64 / rate;
+                    eprint!(
+                        "\rSolving... {} / {} ({:.1}%) [depth ~{}] [{:.0} pos/sec, ETA: {}]  ",
+                        n, total, 100.0 * n as f64 / total as f64, b.moves, rate, fmt_eta(eta)
+                    );
+                }
+                result
+            })
         })
         .collect();
     eprintln!();
@@ -153,8 +161,11 @@ pub fn generate_systematic(
         seen.len()
     );
 
-    // Sort deepest positions first: warm TT with easy positions before hard shallow ones
-    boards.sort_unstable_by_key(|b| std::cmp::Reverse(b.moves));
+    // Sort by opening prefix first, then deepest within each prefix group.
+    // Positions sharing the same first 2 moves go to the same thread chunk,
+    // maximising TT hit rate (sub-positions explored for one position are reused
+    // by the next position in the same opening line).
+    boards.sort_unstable_by_key(|b| (b.prefix_key(2), std::cmp::Reverse(b.moves)));
 
     // Phase 2: Solve in parallel — each thread has its own 160MB TT
     let results = solve_boards_with_progress(&boards);
@@ -259,7 +270,10 @@ pub fn generate_random(
     }
     eprintln!();
 
-    // Phase 2: Solve in parallel — each thread has its own 160MB TT
+    // Sort by opening prefix so each thread chunk stays in the same subtree
+    boards.sort_unstable_by_key(|b| (b.prefix_key(2), std::cmp::Reverse(b.moves)));
+
+    // Phase 2: Solve in parallel — each thread has its own 150MB TT
     solve_boards_with_progress(&boards)
 }
 
