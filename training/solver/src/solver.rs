@@ -10,9 +10,10 @@ const MAX_SCORE: i32 = ((COLS * ROWS) as i32 + 1) / 2 - 3; // 18
 /// - Upper bound stored as: alpha - MIN_SCORE + 1 (range 1..37)
 /// - Lower bound stored as: score + MAX_SCORE - 2*MIN_SCORE + 2 (range 38..74)
 /// - 0 = empty
-/// Uses u32 partial keys and power-of-two size for O(1) bitwise indexing.
+/// Uses full 64-bit keys to eliminate false-positive collisions, with power-of-two
+/// size for O(1) bitwise indexing (~9 bytes/entry: u64 key + u8 value).
 pub struct TranspositionTable {
-    keys: Vec<u32>,
+    keys: Vec<u64>,
     values: Vec<u8>,
     mask: usize, // size - 1; size must be a power of two
 }
@@ -21,7 +22,7 @@ impl TranspositionTable {
     pub fn new(size: usize) -> Self {
         debug_assert!(size.is_power_of_two(), "TT size must be a power of two");
         TranspositionTable {
-            keys: vec![0u32; size],
+            keys: vec![0u64; size],
             values: vec![0u8; size],
             mask: size - 1,
         }
@@ -35,13 +36,13 @@ impl TranspositionTable {
     #[inline(always)]
     pub fn get(&self, key: u64) -> u8 {
         let idx = self.index(key);
-        if self.keys[idx] == key as u32 { self.values[idx] } else { 0 }
+        if self.keys[idx] == key { self.values[idx] } else { 0 }
     }
 
     #[inline(always)]
     pub fn put(&mut self, key: u64, value: u8) {
         let idx = self.index(key);
-        self.keys[idx] = key as u32;
+        self.keys[idx] = key;
         self.values[idx] = value;
     }
 
@@ -60,8 +61,8 @@ pub struct Solver {
 impl Solver {
     pub fn new() -> Self {
         Solver {
-            // 2^25 = 33,554,432 entries × 5 bytes = ~160MB per thread
-            table: TranspositionTable::new(1 << 25),
+            // 2^24 = 16,777,216 entries × 9 bytes = ~150MB per thread
+            table: TranspositionTable::new(1 << 24),
             node_count: 0,
         }
     }
