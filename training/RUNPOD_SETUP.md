@@ -1,6 +1,7 @@
-# RunPod Setup — Connect Four LLM Training
+# RunPod Setup — Connect Four GRPO Training
 
 Train 3 model sizes in parallel on RunPod, with live Weights & Biases monitoring.
+No SFT needed — Qwen3 already knows JSON and has native thinking. All budget goes to GRPO.
 
 ## Pod Specs
 
@@ -46,21 +47,21 @@ huggingface-cli login
 
 ## Step 2: Launch Training
 
-Run one command per pod. Each runs SFT then GRPO automatically:
+One command per pod — GRPO directly from the base model:
 
 **Pod 1 (4B):**
 ```bash
-python connect4_train.py --model 4b --stage both --csv connect4_data.csv
+python connect4_train.py --model 4b --stage grpo --csv connect4_data.csv
 ```
 
 **Pod 2 (8B):**
 ```bash
-python connect4_train.py --model 8b --stage both --csv connect4_data.csv
+python connect4_train.py --model 8b --stage grpo --csv connect4_data.csv
 ```
 
 **Pod 3 (14B):**
 ```bash
-python connect4_train.py --model 14b --stage both --csv connect4_data.csv
+python connect4_train.py --model 14b --stage grpo --csv connect4_data.csv
 ```
 
 All three will stream metrics to the same wandb project.
@@ -73,21 +74,17 @@ Go to [wandb.ai](https://wandb.ai) and open project **"connect4-llm"**.
 
 ### What to watch
 
-**During SFT** (the boring part):
-- `train/loss` should decrease steadily. That's it.
-
-**During GRPO** (the good stuff):
-- `reward` — aggregate reward, should climb starting around step 300.
-- `reward_move_quality` — the oracle score ([-1, +1]). This is the metric that matters most. Higher = the model is picking better moves.
+- `reward` — aggregate reward, should climb starting around step 200-400.
+- `reward_move_quality` — the oracle score ([-1, +1]). **This is the metric that matters most.** Higher = the model is picking better moves.
 - `reward_is_best_move` — binary bonus. Tracks how often the model picks the single best column.
-- `reward_format` — should quickly saturate near 0.5 (the model learns to output a digit fast).
+- `reward_format` — should climb toward 0.5 as the model learns to output valid JSON with a "column" field.
 - `reward_std` — should decrease over time as the model becomes more consistent.
 
 ### Compare all 3 models
 
-1. In the wandb dashboard, select all runs (sft-4b, grpo-4b, sft-8b, grpo-8b, etc.).
+1. In the wandb dashboard, select all grpo runs (grpo-4b, grpo-8b, grpo-14b).
 2. Use the "Group by" → tag to compare by model size.
-3. Create a custom chart panel overlaying `reward_move_quality` for grpo-4b, grpo-8b, grpo-14b.
+3. Create a custom chart panel overlaying `reward_move_quality` for all 3 runs.
 4. The model where this curve is highest and most stable is your winner.
 
 ---
@@ -110,6 +107,8 @@ python connect4_train.py --model 14b --stage eval --csv connect4_data.csv
 This evaluates on 10K held-out positions and saves results to `eval_results_{size}.json`.
 
 Download the JSON files and compare:
+- **Valid output %** — parsed a column from the response
+- **JSON format %** — produced proper JSON (not just a bare digit)
 - **Exact match %** — how often it picks the oracle's best move
 - **Top-2 match %** — picked one of the two best moves
 - **Mean oracle score** — average quality of chosen moves
@@ -160,8 +159,9 @@ model = AutoModelForCausalLM.from_pretrained("yourname/connect4-agent-8b")
 
 ### OOM (Out of Memory)
 
-If you get CUDA OOM errors:
-- **4B/8B on 4090:** Reduce `grpo_num_generations` (edit the `MODEL_CONFIGS` dict in the script). Try 4 for 4B, 2 for 8B.
+The models generate up to 3072 tokens per completion (thinking + JSON). If you get CUDA OOM errors:
+- **4B on 4090:** Reduce `grpo_num_generations` from 4 to 3 in `MODEL_CONFIGS`.
+- **8B on 4090:** Reduce `grpo_num_generations` from 3 to 2.
 - **14B:** Upgrade to an A100 80GB or H100. Or reduce `grpo_num_generations` to 2.
 
 ### Reward stays flat during GRPO
@@ -169,12 +169,15 @@ If you get CUDA OOM errors:
 - Lower temperature (try 0.5 instead of 0.7) — the model may be generating too randomly.
 - Increase `grpo_grad_accum` to 8 or 16 for more stable gradients.
 - Try the DR-GRPO loss variant: `--loss-type dr_grpo`.
-- Make sure SFT completed successfully first — GRPO needs a good starting point.
+
+### reward_format stays at -1.0
+
+If the model can't produce parseable output after ~100 steps, it may need a lightweight SFT warmup to learn the JSON format. Add a small SFT stage (~5K examples, 1 epoch) before GRPO.
 
 ### Pod disconnects mid-training
 
-- Checkpoints are saved every 300/500 steps in `outputs_sft_{size}/` and `outputs_grpo_{size}/`.
-- The trainers will auto-resume from the latest checkpoint if you re-run the same command.
+- Checkpoints are saved every 300 steps in `outputs_grpo_{size}/`.
+- The trainer will auto-resume from the latest checkpoint if you re-run the same command.
 - For extra safety, use RunPod's persistent storage (network volume) to keep checkpoints across pod restarts.
 
 ### Budget saver tip
