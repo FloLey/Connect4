@@ -175,7 +175,7 @@ def get_config(model_size):
 
 def load_csv_data(csv_path):
     data = []
-    with open(csv_path, "r") as f:
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             data.append({
@@ -344,7 +344,8 @@ def run_grpo(config, train_data):
     dataset = prepare_grpo_dataset(train_data, config["grpo_max_rows"], tokenizer)
     run_name = f"grpo-{config['model_size']}"
 
-    if WANDB_AVAILABLE:
+    use_wandb = config.get("use_wandb", False)
+    if use_wandb:
         wandb.init(
             project=config["wandb_project"],
             name=run_name,
@@ -375,7 +376,7 @@ def run_grpo(config, train_data):
         optim="adamw_8bit",
         logging_steps=1,
         save_steps=300,
-        report_to="wandb" if WANDB_AVAILABLE else "none",
+        report_to="wandb" if use_wandb else "none",
         run_name=run_name,
     )
     if config.get("grpo_loss_type"):
@@ -396,7 +397,7 @@ def run_grpo(config, train_data):
     print("\nStarting GRPO... Watch reward climb at https://wandb.ai -> connect4-llm")
     print(f"  max_completion_length=3072 (extended thinking enabled)")
     trainer.train()
-    if WANDB_AVAILABLE:
+    if use_wandb:
         wandb.finish()
     model.save_pretrained(config["grpo_output"])
     tokenizer.save_pretrained(config["grpo_output"])
@@ -453,7 +454,7 @@ def run_eval(config, eval_data):
         ).to(model.device)
 
         with torch.no_grad():
-            outputs = model.generate(input_ids=inputs, max_new_tokens=3072, temperature=0.01, do_sample=True)
+            outputs = model.generate(input_ids=inputs, max_new_tokens=3072, do_sample=False)
         response = tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True)
         col = extract_column_from_response(response)
 
@@ -529,6 +530,9 @@ def push_to_hub(config):
     if not hf_repo:
         print("ERROR: --hf-repo is required for push stage (e.g. yourname/connect4-agent-8b)")
         return
+    if hf_repo.upper().endswith("-GGUF"):
+        print("WARNING: --hf-repo should be the base repo name. Stripping '-GGUF' suffix.")
+        hf_repo = hf_repo[:-5]
     api = HfApi()
     size = config["model_size"]
     merged_dir = config["final_model"]
@@ -564,16 +568,15 @@ def main():
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
 
-    if args.no_wandb:
-        global WANDB_AVAILABLE
-        WANDB_AVAILABLE = False
+    use_wandb = WANDB_AVAILABLE and not args.no_wandb
 
     config = get_config(args.model)
     config["csv_path"] = args.csv
     config["hf_repo"] = args.hf_repo
     config["grpo_loss_type"] = args.loss_type
+    config["use_wandb"] = use_wandb
 
-    print(f"\nConnect Four Pipeline | Model: {config['model_name']} | Stage: {args.stage} | Wandb: {'on' if WANDB_AVAILABLE else 'off'}")
+    print(f"\nConnect Four Pipeline | Model: {config['model_name']} | Stage: {args.stage} | Wandb: {'on' if use_wandb else 'off'}")
 
     train_data, eval_data = split_data(config["csv_path"])
     print(f"Data split: {len(train_data)} train, {len(eval_data)} eval (seed=42, no overlap)")
