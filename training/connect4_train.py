@@ -314,7 +314,7 @@ def run_sft(config, train_data):
             per_device_train_batch_size=8,
             gradient_accumulation_steps=2,
             warmup_steps=20,
-            max_steps=40,
+            max_steps=50,
             learning_rate=2e-5,
             logging_steps=1,
             optim="adamw_8bit",
