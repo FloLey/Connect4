@@ -540,19 +540,31 @@ def run_grpo(config, train_data):
 
     # Load from SFT checkpoint if available, otherwise base model
     sft_dir = config["grpo_output"] + "_sft"
-    if os.path.exists(sft_dir):
-        print(f"  Loading from SFT checkpoint: {sft_dir}")
-        load_model = sft_dir
+    use_sft = os.path.exists(sft_dir)
+
+    if use_sft:
+        # SFT checkpoint: merge LoRA into base, then apply fresh LoRA for GRPO
+        print(f"  Loading SFT checkpoint and merging adapters: {sft_dir}")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=config["model_name"],
+            max_seq_length=config["max_seq_length"],
+            load_in_4bit=False,
+            fast_inference=False,
+        )
+        # Load and merge SFT adapters into base weights
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, sft_dir)
+        model = model.merge_and_unload()
     else:
         print("  WARNING: No SFT checkpoint found. Run --stage sft first for best results.")
-        load_model = config["model_name"]
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=config["model_name"],
+            max_seq_length=config["max_seq_length"],
+            load_in_4bit=False,
+            fast_inference=False,
+        )
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=load_model,
-        max_seq_length=config["max_seq_length"],
-        load_in_4bit=False,
-        fast_inference=False,
-    )
+    # Apply fresh LoRA for GRPO training
     model = FastLanguageModel.get_peft_model(
         model,
         r=config["lora_r"],
