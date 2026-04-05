@@ -1,8 +1,8 @@
 """
-Connect Four LLM Training Pipeline — GRPO with Unsloth
+Connect Four LLM Training Pipeline — GRPO with Unsloth (Gemma 4)
 Usage:
-  python connect4_train.py --model {4b,8b,14b} --stage {grpo,eval,export,push} --csv connect4_data.csv
-  python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
+  python connect4_train.py --model {e2b-bf16,e2b-8bit,e4b-bf16,e4b-8bit} --stage {grpo,eval,export,push} --csv connect4_data.csv
+  python connect4_train.py --model e4b-bf16 --stage push --hf-repo yourname/connect4-agent-e4b-bf16
 """
 
 import argparse
@@ -12,8 +12,12 @@ import os
 import re
 import random
 
+import math
+
 import torch
 from datasets import Dataset
+from torch.utils.data import Sampler
+from transformers import TrainerCallback
 
 try:
     import wandb
@@ -90,7 +94,7 @@ def reconstruct_board(move_sequence):
 # PRODUCTION PROMPT TEMPLATES (mirrors backend/app/engine/ai.py)
 # =============================================================================
 
-SYSTEM_TEMPLATE = """
+SYSTEM_TEMPLATE = """<|think|>
 You are an expert Connect Four player engine.
 You are Player {player_id} (Symbol: {symbol}).
 Opponent is Player {opponent_id} (Symbol: {opp_symbol}).
@@ -138,9 +142,10 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "4b": {"model_name": "unsloth/Qwen3-4B", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
-    "8b": {"model_name": "unsloth/Qwen3-8B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
-    "14b": {"model_name": "unsloth/Qwen3-14B", "lora_r": 16, "grpo_num_generations": 3, "grpo_batch_size": 1, "grpo_grad_accum": 8},
+    "e2b-bf16": {"model_name": "unsloth/gemma-4-E2B-it", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2, "load_in_4bit": False, "load_in_8bit": False},
+    "e2b-8bit": {"model_name": "unsloth/gemma-4-E2B-it", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2, "load_in_4bit": False, "load_in_8bit": True},
+    "e4b-bf16": {"model_name": "unsloth/gemma-4-E4B-it", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4, "load_in_4bit": False, "load_in_8bit": False},
+    "e4b-8bit": {"model_name": "unsloth/gemma-4-E4B-it", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4, "load_in_4bit": False, "load_in_8bit": True},
 }
 
 
@@ -150,7 +155,8 @@ def get_config(model_size):
         "model_name": mc["model_name"],
         "model_size": model_size,
         "max_seq_length": 4096,
-        "load_in_4bit": True,
+        "load_in_4bit": mc.get("load_in_4bit", False),
+        "load_in_8bit": mc.get("load_in_8bit", False),
         "lora_r": mc["lora_r"],
         "lora_alpha": mc["lora_r"],
         "lora_dropout": 0,
@@ -190,13 +196,25 @@ def build_lookup_table(data):
     return {e["move_sequence"]: e["scores"] for e in data}
 
 
+def difficulty_score(entry):
+    """How hard is this position? Lower = easier (bigger gap between best and 2nd best)."""
+    scores = entry["scores"]
+    sorted_scores = sorted(scores, reverse=True)
+    return sorted_scores[0] - sorted_scores[1]
+
+
+def sort_by_difficulty(data):
+    """Sort positions from easiest (obvious best move) to hardest (ambiguous)."""
+    return sorted(data, key=difficulty_score, reverse=True)
+
+
 def split_data(csv_path):
     """Single deterministic train/eval split to prevent data leakage."""
     raw_data = load_csv_data(csv_path)
     random.seed(42)
     random.shuffle(raw_data)
     eval_data = raw_data[-10_000:]
-    train_data = raw_data[:-10_000]
+    train_data = sort_by_difficulty(raw_data[:-10_000])
     return train_data, eval_data
 
 
@@ -212,20 +230,133 @@ def prepare_grpo_dataset(data, max_rows, tokenizer):
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ]
+        best_score = max(entry["scores"])
         formatted.append({
             "prompt": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=True),
             "move_sequence": entry["move_sequence"],
+            "max_reward": best_score * 10.0 + 1.0,
         })
     return Dataset.from_list(formatted)
 
 
 # =============================================================================
-# OUTPUT PARSING (handles Qwen3 <think> blocks + JSON)
+# CURRICULUM LEARNING — Gaussian adaptive difficulty (10 levels)
+# =============================================================================
+
+NUM_BUCKETS = 10
+
+
+class GaussianCurriculumSampler(Sampler):
+    """Samples from difficulty buckets using a Gaussian distribution.
+
+    Dataset is pre-sorted easy→hard, split into NUM_BUCKETS equal buckets.
+    A Gaussian centered on `center` (0=easy, 9=hard) controls sampling
+    probability per bucket. The center advances as the model improves.
+    """
+
+    def __init__(self, dataset_size, num_buckets=NUM_BUCKETS, sigma=1.5, seed=42):
+        self.dataset_size = dataset_size
+        self.num_buckets = num_buckets
+        self.sigma = sigma
+        self.center = 0.0
+        self.rng = random.Random(seed)
+
+        # Precompute bucket index ranges
+        bucket_size = dataset_size // num_buckets
+        self.bucket_ranges = []
+        for b in range(num_buckets):
+            start = b * bucket_size
+            end = start + bucket_size if b < num_buckets - 1 else dataset_size
+            self.bucket_ranges.append((start, end))
+
+    def _bucket_probs(self):
+        raw = [math.exp(-((i - self.center) ** 2) / (2 * self.sigma ** 2)) for i in range(self.num_buckets)]
+        total = sum(raw)
+        return [p / total for p in raw]
+
+    def __len__(self):
+        return self.dataset_size
+
+    def __iter__(self):
+        probs = self._bucket_probs()
+        indices = []
+        for _ in range(self.dataset_size):
+            # Pick bucket according to Gaussian probs
+            r = self.rng.random()
+            cumsum = 0.0
+            bucket = 0
+            for i, p in enumerate(probs):
+                cumsum += p
+                if r <= cumsum:
+                    bucket = i
+                    break
+            # Pick random index within that bucket
+            start, end = self.bucket_ranges[bucket]
+            indices.append(self.rng.randint(start, end - 1))
+        return iter(indices)
+
+    def advance(self):
+        self.center = min(self.center + 1.0, self.num_buckets - 1)
+
+
+class CurriculumCallback(TrainerCallback):
+    """Advances the Gaussian center when the model approaches optimal play.
+
+    Tracks actual rewards vs max possible rewards for positions seen.
+    When ratio >= threshold over `check_interval` steps, advances to next level.
+    """
+
+    def __init__(self, sampler, reward_calc, threshold=0.7, check_interval=100):
+        self.sampler = sampler
+        self.reward_calc = reward_calc
+        self.threshold = threshold
+        self.check_interval = check_interval
+        self.last_check_step = 0
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+
+        # Log curriculum state
+        if logs is not None:
+            logs["curriculum_level"] = self.sampler.center
+            if self.reward_calc.max_reward_log:
+                avg_max = sum(self.reward_calc.max_reward_log) / len(self.reward_calc.max_reward_log)
+                avg_got = sum(self.reward_calc.reward_log) / len(self.reward_calc.reward_log)
+                logs["curriculum_ratio"] = avg_got / avg_max if avg_max != 0 else 0.0
+
+        if state.global_step - self.last_check_step < self.check_interval:
+            return
+        if self.sampler.center >= self.sampler.num_buckets - 1:
+            return
+
+        # Compute ratio from tracked rewards
+        if not self.reward_calc.max_reward_log:
+            return
+        avg_max = sum(self.reward_calc.max_reward_log) / len(self.reward_calc.max_reward_log)
+        avg_got = sum(self.reward_calc.reward_log) / len(self.reward_calc.reward_log)
+        ratio = avg_got / avg_max if avg_max != 0 else 0.0
+
+        if ratio >= self.threshold:
+            self.sampler.advance()
+            probs = self.sampler._bucket_probs()
+            top_buckets = sorted(range(len(probs)), key=lambda i: probs[i], reverse=True)[:3]
+            print(f"\n>>> CURRICULUM: ratio {ratio:.2f} >= {self.threshold}, advancing to level {self.sampler.center:.0f}/9")
+            print(f"    Top buckets: {['L'+str(b) + f'({probs[b]:.0%})' for b in top_buckets]}")
+
+        # Reset logs for next interval
+        self.reward_calc.max_reward_log.clear()
+        self.reward_calc.reward_log.clear()
+        self.last_check_step = state.global_step
+
+
+# =============================================================================
+# OUTPUT PARSING (handles Gemma 4 <|channel>thought blocks + JSON)
 # =============================================================================
 
 def strip_thinking(text):
-    """Remove <think>...</think> blocks from Qwen3 output."""
-    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    """Remove Gemma 4 thinking blocks from output."""
+    return re.sub(r'<\|channel>thought.*?<channel\|>', '', text, flags=re.DOTALL).strip()
 
 
 def extract_column_from_response(text):
@@ -274,46 +405,32 @@ def classify_format(text):
 class RewardCalculator:
     def __init__(self, data):
         self.score_lookup = build_lookup_table(data)
+        # Tracked by CurriculumCallback to compute reward/max ratio
+        self.reward_log = []
+        self.max_reward_log = []
 
     def reward_format(self, completions, **kwargs):
         """Reward for producing valid structured output."""
         rewards = []
         for c in completions:
             fmt = classify_format(c)
-            if fmt == "json":
-                rewards.append(0.5)
-            elif fmt == "regex":
-                rewards.append(0.25)
+            rewards.append(1.0 if fmt == "json" else -10.0)
+        return rewards
+
+    def reward_move_quality(self, completions, move_sequence, max_reward=None, **kwargs):
+        """Core reward: oracle tanh score for the chosen column, scaled to [-10, +10]."""
+        rewards = []
+        for i, (c, seq) in enumerate(zip(completions, move_sequence)):
+            col = extract_column_from_response(c)
+            if col is None:
+                rewards.append(-10.0)
             else:
-                rewards.append(-1.0)
-        return rewards
-
-    def reward_move_quality(self, completions, move_sequence, **kwargs):
-        """Core reward: oracle tanh score for the chosen column."""
-        rewards = []
-        for c, seq in zip(completions, move_sequence):
-            col = extract_column_from_response(c)
-            if col is None:
-                rewards.append(-1.0)
-                continue
-            scores = self.score_lookup.get(seq)
-            rewards.append(scores[col] if scores else 0.0)
-        return rewards
-
-    def reward_is_best_move(self, completions, move_sequence, **kwargs):
-        """Bonus: +1.0 if the chosen column is the oracle's best."""
-        rewards = []
-        for c, seq in zip(completions, move_sequence):
-            col = extract_column_from_response(c)
-            if col is None:
-                rewards.append(-0.5)
-                continue
-            scores = self.score_lookup.get(seq)
-            if not scores:
-                rewards.append(0.0)
-                continue
-            best_col = max(range(7), key=lambda x: scores[x])
-            rewards.append(1.0 if col == best_col else 0.0)
+                scores = self.score_lookup.get(seq)
+                rewards.append(scores[col] * 10.0 if scores else 0.0)
+            # Track for curriculum: actual reward vs max possible
+            self.reward_log.append(rewards[-1])
+            if max_reward is not None:
+                self.max_reward_log.append(max_reward[i])
         return rewards
 
 
@@ -330,6 +447,7 @@ def run_grpo(config, train_data):
         model_name=config["model_name"],
         max_seq_length=config["max_seq_length"],
         load_in_4bit=config["load_in_4bit"],
+        load_in_8bit=config["load_in_8bit"],
     )
     model = FastLanguageModel.get_peft_model(
         model,
@@ -343,6 +461,15 @@ def run_grpo(config, train_data):
     print(f"Training on {len(train_data)} positions, {len(reward_calc.score_lookup)} in lookup")
     dataset = prepare_grpo_dataset(train_data, config["grpo_max_rows"], tokenizer)
     run_name = f"grpo-{config['model_size']}"
+
+    # Gaussian curriculum: 10 difficulty levels, advances when reward/max >= threshold
+    sampler = GaussianCurriculumSampler(len(dataset))
+    curriculum_cb = CurriculumCallback(
+        sampler, reward_calc,
+        threshold=config.get("curriculum_threshold", 0.7),
+        check_interval=100,
+    )
+    print(f"  Curriculum: Gaussian over {NUM_BUCKETS} levels, threshold={config.get('curriculum_threshold', 0.7)}")
 
     use_wandb = config.get("use_wandb", False)
     if use_wandb:
@@ -388,14 +515,16 @@ def run_grpo(config, train_data):
         reward_funcs=[
             reward_calc.reward_format,
             reward_calc.reward_move_quality,
-            reward_calc.reward_is_best_move,
         ],
         args=GRPOConfig(**grpo_kwargs),
         train_dataset=dataset,
+        callbacks=[curriculum_cb],
     )
+    trainer.sampler = sampler
 
     print("\nStarting GRPO... Watch reward climb at https://wandb.ai -> connect4-llm")
     print(f"  max_completion_length=3072 (extended thinking enabled)")
+    print(f"  Curriculum: level 0→9 (easy→hard), Gaussian σ=1.5, advances at {config.get('curriculum_threshold', 0.7):.0%} ratio")
     trainer.train()
     if use_wandb:
         wandb.finish()
@@ -421,6 +550,7 @@ def run_eval(config, eval_data):
         model_name=checkpoint_dir,
         max_seq_length=config["max_seq_length"],
         load_in_4bit=config["load_in_4bit"],
+        load_in_8bit=config["load_in_8bit"],
     )
     FastLanguageModel.for_inference(model)
     print(f"Evaluating on {len(eval_data)} held-out positions...")
@@ -515,6 +645,7 @@ def export_model(config):
         model_name=config["grpo_output"],
         max_seq_length=config["max_seq_length"],
         load_in_4bit=config["load_in_4bit"],
+        load_in_8bit=config["load_in_8bit"],
     )
     model.save_pretrained_merged(config["final_model"], tokenizer, save_method="merged_16bit")
     model.save_pretrained_gguf(config["final_model"] + "-gguf", tokenizer, quantization_method="q4_k_m")
@@ -560,10 +691,12 @@ def push_to_hub(config):
 
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GRPO Training Pipeline")
-    parser.add_argument("--model", choices=["4b", "8b", "14b"], required=True)
+    parser.add_argument("--model", choices=["e2b-bf16", "e2b-8bit", "e4b-bf16", "e4b-8bit"], required=True)
     parser.add_argument("--stage", choices=["grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
+    parser.add_argument("--max-steps", type=int, default=None, help="Override max training steps (default: 2000)")
+    parser.add_argument("--curriculum-threshold", type=float, default=0.7, help="Advance difficulty when reward/max >= this (default: 0.7)")
     parser.add_argument("--loss-type", default=None, help="GRPO loss type (e.g. dr_grpo)")
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
@@ -574,6 +707,9 @@ def main():
     config["csv_path"] = args.csv
     config["hf_repo"] = args.hf_repo
     config["grpo_loss_type"] = args.loss_type
+    config["curriculum_threshold"] = args.curriculum_threshold
+    if args.max_steps:
+        config["grpo_max_steps"] = args.max_steps
     config["use_wandb"] = use_wandb
 
     print(f"\nConnect Four Pipeline | Model: {config['model_name']} | Stage: {args.stage} | Wandb: {'on' if use_wandb else 'off'}")

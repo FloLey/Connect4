@@ -1,17 +1,18 @@
-# RunPod Setup — Connect Four GRPO Training
+# RunPod Setup — Connect Four GRPO Training (Gemma 4)
 
-Train 3 model sizes in parallel on RunPod, with live Weights & Biases monitoring.
-No SFT needed — Qwen3 already knows JSON and has native thinking. All budget goes to GRPO.
+Train Gemma 4 models on RunPod with live Weights & Biases monitoring.
+No SFT needed — Gemma 4 already knows JSON and has native thinking (`<|think|>`). All budget goes to GRPO.
 
 ## Pod Specs
 
-| Pod | Model | GPU | Est. Cost/hr | Est. Time | Est. Total |
-|-----|-------|-----|--------------|-----------|------------|
-| Pod 1 | Qwen3-4B | RTX 4090 (24 GB) | ~$0.50/hr | ~2h | ~$1.00 |
-| Pod 2 | Qwen3-8B | RTX 4090 (24 GB) | ~$0.50/hr | ~3h | ~$1.50 |
-| Pod 3 | Qwen3-14B | A100 40GB | ~$1.50/hr | ~3.5h | ~$5.25 |
+| Pod | Model | Precision | GPU | VRAM Used | Est. Cost/hr | Est. Time | Est. Total |
+|-----|-------|-----------|-----|-----------|--------------|-----------|------------|
+| Pod 1 | gemma-4-E2B-it | BF16 | RTX 4090 (24 GB) | ~15 GB | ~$0.50/hr | ~2h | ~$1.00 |
+| Pod 2 | gemma-4-E2B-it | 8-bit | RTX 4090 (24 GB) | ~9 GB | ~$0.50/hr | ~2h | ~$1.00 |
+| Pod 3 | gemma-4-E4B-it | BF16 | RTX 4090 (24 GB) | ~20 GB | ~$0.50/hr | ~3h | ~$1.50 |
+| Pod 4 | gemma-4-E4B-it | 8-bit | RTX 4090 (24 GB) | ~12 GB | ~$0.50/hr | ~3h | ~$1.50 |
 
-**Total estimated cost: ~$8**
+**Total estimated cost: ~$5**
 
 ---
 
@@ -49,22 +50,27 @@ huggingface-cli login
 
 One command per pod — GRPO directly from the base model:
 
-**Pod 1 (4B):**
+**Pod 1 (E2B BF16):**
 ```bash
-python connect4_train.py --model 4b --stage grpo --csv connect4_data.csv
+python connect4_train.py --model e2b-bf16 --stage grpo --csv connect4_data.csv
 ```
 
-**Pod 2 (8B):**
+**Pod 2 (E2B 8-bit):**
 ```bash
-python connect4_train.py --model 8b --stage grpo --csv connect4_data.csv
+python connect4_train.py --model e2b-8bit --stage grpo --csv connect4_data.csv
 ```
 
-**Pod 3 (14B):**
+**Pod 3 (E4B BF16):**
 ```bash
-python connect4_train.py --model 14b --stage grpo --csv connect4_data.csv
+python connect4_train.py --model e4b-bf16 --stage grpo --csv connect4_data.csv
 ```
 
-All three will stream metrics to the same wandb project.
+**Pod 4 (E4B 8-bit):**
+```bash
+python connect4_train.py --model e4b-8bit --stage grpo --csv connect4_data.csv
+```
+
+All four will stream metrics to the same wandb project.
 
 ---
 
@@ -75,16 +81,18 @@ Go to [wandb.ai](https://wandb.ai) and open project **"connect4-llm"**.
 ### What to watch
 
 - `reward` — aggregate reward, should climb starting around step 200-400.
-- `reward_move_quality` — the oracle score ([-1, +1]). **This is the metric that matters most.** Higher = the model is picking better moves.
-- `reward_is_best_move` — binary bonus. Tracks how often the model picks the single best column.
-- `reward_format` — should climb toward 0.5 as the model learns to output valid JSON with a "column" field.
-- `reward_std` — should decrease over time as the model becomes more consistent.
+- `reward_move_quality` — the oracle score scaled to **[-10, +10]**. **This is the metric that matters most.** Higher = the model is picking better moves.
+- `reward_format` — should climb toward +1.0 as the model learns to output valid JSON. If it stays at -10.0, the model is failing to produce parseable JSON.
+- `curriculum_level` �� current difficulty level (0=easy, 9=hard). Watch it climb as the model improves.
+- `curriculum_ratio` — reward obtained / max possible. When this hits 0.7, the level advances.
 
-### Compare all 3 models
+**Expected pattern:** reward climbs → level advances → reward drops (harder positions) → reward climbs back → repeat. This sawtooth pattern is healthy — it means the model is progressively mastering harder positions.
 
-1. In the wandb dashboard, select all grpo runs (grpo-4b, grpo-8b, grpo-14b).
-2. Use the "Group by" → tag to compare by model size.
-3. Create a custom chart panel overlaying `reward_move_quality` for all 3 runs.
+### Compare all 4 models
+
+1. In the wandb dashboard, select all grpo runs.
+2. Use the "Group by" -> tag to compare by model variant.
+3. Create a custom chart panel overlaying `reward_move_quality` for all 4 runs.
 4. The model where this curve is highest and most stable is your winner.
 
 ---
@@ -94,21 +102,17 @@ Go to [wandb.ai](https://wandb.ai) and open project **"connect4-llm"**.
 After training completes on each pod:
 
 ```bash
-# Pod 1
-python connect4_train.py --model 4b --stage eval --csv connect4_data.csv
-
-# Pod 2
-python connect4_train.py --model 8b --stage eval --csv connect4_data.csv
-
-# Pod 3
-python connect4_train.py --model 14b --stage eval --csv connect4_data.csv
+python connect4_train.py --model e2b-bf16 --stage eval --csv connect4_data.csv
+python connect4_train.py --model e2b-8bit --stage eval --csv connect4_data.csv
+python connect4_train.py --model e4b-bf16 --stage eval --csv connect4_data.csv
+python connect4_train.py --model e4b-8bit --stage eval --csv connect4_data.csv
 ```
 
-This evaluates on 10K held-out positions and saves results to `eval_results_{size}.json`.
+This evaluates on 10K held-out positions and saves results to `eval_results_{variant}.json`.
 
 Download the JSON files and compare:
 - **Valid output %** — parsed a column from the response
-- **JSON format %** — produced proper JSON (not just a bare digit)
+- **JSON format %** — produced proper `{"column": N}` JSON
 - **Exact match %** — how often it picks the oracle's best move
 - **Top-2 match %** — picked one of the two best moves
 - **Mean oracle score** — average quality of chosen moves
@@ -121,12 +125,12 @@ Download the JSON files and compare:
 On the pod with the best eval results:
 
 ```bash
-python connect4_train.py --model 8b --stage export --csv connect4_data.csv
+python connect4_train.py --model e4b-bf16 --stage export --csv connect4_data.csv
 ```
 
 This creates:
-- `connect4-agent-{size}/` — merged HuggingFace model (16-bit)
-- `connect4-agent-{size}-gguf/` — quantized GGUF (q4_k_m) for llama.cpp / Ollama
+- `connect4-agent-{variant}/` — merged HuggingFace model (16-bit)
+- `connect4-agent-{variant}-gguf/` — quantized GGUF (q4_k_m) for llama.cpp / Ollama
 
 ---
 
@@ -135,23 +139,12 @@ This creates:
 After exporting, push to HuggingFace Hub so you can reuse the model anywhere:
 
 ```bash
-python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
+python connect4_train.py --model e4b-bf16 --stage push --hf-repo yourname/connect4-agent-e4b-bf16
 ```
 
 This uploads two repos:
-- `yourname/connect4-agent-8b` — the merged 16-bit model (use with `transformers` / vLLM)
-- `yourname/connect4-agent-8b-GGUF` — the quantized GGUF (use with llama.cpp / Ollama)
-
-To use later:
-```python
-# With transformers
-from transformers import AutoModelForCausalLM, AutoTokenizer
-model = AutoModelForCausalLM.from_pretrained("yourname/connect4-agent-8b")
-
-# With Ollama
-# Download the GGUF file from the -GGUF repo, then:
-# ollama create connect4 -f Modelfile
-```
+- `yourname/connect4-agent-e4b-bf16` — the merged 16-bit model (use with `transformers` / vLLM)
+- `yourname/connect4-agent-e4b-bf16-GGUF` — the quantized GGUF (use with llama.cpp / Ollama)
 
 ---
 
@@ -159,10 +152,10 @@ model = AutoModelForCausalLM.from_pretrained("yourname/connect4-agent-8b")
 
 ### OOM (Out of Memory)
 
-The models generate up to 3072 tokens per completion (thinking + JSON). If you get CUDA OOM errors:
-- **4B on 4090:** Reduce `grpo_num_generations` from 4 to 3 in `MODEL_CONFIGS`.
-- **8B on 4090:** Reduce `grpo_num_generations` from 3 to 2.
-- **14B:** Upgrade to an A100 80GB or H100. Or reduce `grpo_num_generations` to 2.
+All 4 variants should fit on a 24 GB RTX 4090. If you get CUDA OOM:
+- Reduce `grpo_num_generations` in `MODEL_CONFIGS` (e.g. from 4 to 3 for E2B, from 3 to 2 for E4B).
+- Reduce `grpo_batch_size` to 1.
+- The 8-bit variants use significantly less VRAM — try those first if BF16 is tight.
 
 ### Reward stays flat during GRPO
 
@@ -170,19 +163,18 @@ The models generate up to 3072 tokens per completion (thinking + JSON). If you g
 - Increase `grpo_grad_accum` to 8 or 16 for more stable gradients.
 - Try the DR-GRPO loss variant: `--loss-type dr_grpo`.
 
-### reward_format stays at -1.0
+### reward_format stays at -10.0
 
-If the model can't produce parseable output after ~100 steps, it may need a lightweight SFT warmup to learn the JSON format. Add a small SFT stage (~5K examples, 1 epoch) before GRPO.
+If the model can't produce parseable JSON after ~100 steps, it may need a lightweight SFT warmup to learn the JSON format. Add a small SFT stage (~5K examples, 1 epoch) before GRPO.
 
 ### Pod disconnects mid-training
 
-- Checkpoints are saved every 300 steps in `outputs_grpo_{size}/`.
+- Checkpoints are saved every 300 steps in `outputs_grpo_{variant}/`.
 - The trainer will auto-resume from the latest checkpoint if you re-run the same command.
 - For extra safety, use RunPod's persistent storage (network volume) to keep checkpoints across pod restarts.
 
 ### Budget saver tip
 
-Skip the 14B model and just race 4B vs 8B:
-- **2 pods × RTX 4090 × ~2.5h avg = ~$2.50 total**
-- The 4B model often surprises — it's fast to train and iterates quickly.
-- If 8B clearly wins, you can always try 14B later.
+Skip the BF16 variants and just race E2B-8bit vs E4B-8bit:
+- **2 pods x RTX 4090 x ~2.5h avg = ~$2.50 total**
+- If E4B-8bit clearly wins, you can always try BF16 later to see if precision matters.
