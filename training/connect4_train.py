@@ -197,10 +197,13 @@ def build_lookup_table(data):
 
 
 def difficulty_score(entry):
-    """How hard is this position? Lower = easier (bigger gap between best and 2nd best)."""
+    """How hard is this position? Higher std = easier (clearer good vs bad moves).
+
+    Returns negative std so sorted(..., reverse=True) puts easy first.
+    """
     scores = entry["scores"]
-    sorted_scores = sorted(scores, reverse=True)
-    return sorted_scores[0] - sorted_scores[1]
+    mean = sum(scores) / len(scores)
+    return -(sum((s - mean) ** 2 for s in scores) / len(scores)) ** 0.5
 
 
 def sort_by_difficulty(data):

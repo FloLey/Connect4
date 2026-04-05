@@ -5,3 +5,5 @@ eval_results_*.json
 wandb/
 __pycache__/
 *.pyc
+solver/book.bin
+solver/training_data/systematic_d10.csv
