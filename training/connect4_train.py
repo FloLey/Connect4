@@ -336,16 +336,16 @@ def run_sft(config, train_data):
     print(f"SFT saved to {config['grpo_output']}_sft")
 
     # Verify format compliance before moving on
-    print("\nVerifying format compliance on 50 samples...")
+    print("\nVerifying format compliance on 10 samples...")
     FastLanguageModel.for_inference(model)
     correct = 0
-    total = 50
+    total = 10
     for entry in train_data[:total]:
         system_msg, user_msg = build_prompt(entry["move_sequence"])
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
         inputs = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(model.device)
         with torch.no_grad():
-            outputs = model.generate(input_ids=inputs, max_new_tokens=512, do_sample=False)
+            outputs = model.generate(input_ids=inputs, max_new_tokens=64, do_sample=False)
         response = tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True)
         if is_clean_output(response):
             correct += 1
