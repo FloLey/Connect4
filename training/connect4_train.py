@@ -1,11 +1,9 @@
 """
-Connect Four LLM Training Pipeline — GRPO with Unsloth (Gemma 4)
+Connect Four LLM Training Pipeline — GRPO with Unsloth (Qwen3)
 Usage:
-  python connect4_train.py --model {e2b-bf16,e2b-8bit,e4b-bf16,e4b-8bit} --stage {grpo,eval,export,push} --csv connect4_data.csv
-  python connect4_train.py --model e4b-bf16 --stage push --hf-repo yourname/connect4-agent-e4b-bf16
+  python connect4_train.py --model {4b,8b} --stage {grpo,eval,export,push} --csv connect4_data.csv
+  python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
 """
-
-import unsloth  # Must be imported first to apply training optimizations
 
 import argparse
 import csv
@@ -96,8 +94,7 @@ def reconstruct_board(move_sequence):
 # PRODUCTION PROMPT TEMPLATES (mirrors backend/app/engine/ai.py)
 # =============================================================================
 
-SYSTEM_TEMPLATE = """<|think|>
-You are an expert Connect Four player engine.
+SYSTEM_TEMPLATE = """You are an expert Connect Four player engine.
 You are Player {player_id} (Symbol: {symbol}).
 Opponent is Player {opponent_id} (Symbol: {opp_symbol}).
 Board: 6 Rows x 7 Columns.
@@ -144,10 +141,8 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "e2b-bf16": {"model_name": "unsloth/gemma-4-E2B-it", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2, "load_in_4bit": False, "load_in_8bit": False},
-    "e2b-8bit": {"model_name": "unsloth/gemma-4-E2B-it", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2, "load_in_4bit": False, "load_in_8bit": True},
-    "e4b-bf16": {"model_name": "unsloth/gemma-4-E4B-it", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4, "load_in_4bit": False, "load_in_8bit": False},
-    "e4b-8bit": {"model_name": "unsloth/gemma-4-E4B-it", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4, "load_in_4bit": False, "load_in_8bit": True},
+    "4b": {"model_name": "unsloth/Qwen3-4B-Base", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "8b": {"model_name": "unsloth/Qwen3-8B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
 }
 
 
@@ -156,11 +151,9 @@ def get_config(model_size):
     return {
         "model_name": mc["model_name"],
         "model_size": model_size,
-        "max_seq_length": 4096,
-        "load_in_4bit": mc.get("load_in_4bit", False),
-        "load_in_8bit": mc.get("load_in_8bit", False),
+        "max_seq_length": 2048,
         "lora_r": mc["lora_r"],
-        "lora_alpha": mc["lora_r"],
+        "lora_alpha": mc["lora_r"] * 2,
         "lora_dropout": 0,
         "grpo_learning_rate": 1e-5,
         "grpo_max_steps": 2000,
@@ -355,12 +348,12 @@ class CurriculumCallback(TrainerCallback):
 
 
 # =============================================================================
-# OUTPUT PARSING (handles Gemma 4 <|channel>thought blocks + JSON)
+# OUTPUT PARSING (handles Qwen3 <think> blocks + JSON)
 # =============================================================================
 
 def strip_thinking(text):
-    """Remove Gemma 4 thinking blocks from output."""
-    return re.sub(r'<\|channel>thought.*?<channel\|>', '', text, flags=re.DOTALL).strip()
+    """Remove <think>...</think> blocks from Qwen3 output."""
+    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
 
 def extract_column_from_response(text):
@@ -443,26 +436,26 @@ class RewardCalculator:
 # =============================================================================
 
 def run_grpo(config, train_data):
-    from unsloth import FastModel
+    import os
+    os.environ["UNSLOTH_VLLM_STANDBY"] = "1"  # Saves 30%+ memory for RL
+    from unsloth import FastLanguageModel
     from trl import GRPOConfig, GRPOTrainer
     print(f"\n{'='*60}\nGRPO TRAINING -- {config['model_name']}\n{'='*60}")
 
-    model, tokenizer = FastModel.from_pretrained(
+    model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config["model_name"],
         max_seq_length=config["max_seq_length"],
-        load_in_4bit=config["load_in_4bit"],
-        load_in_8bit=config["load_in_8bit"],
+        load_in_4bit=False,
+        fast_inference=True,
+        max_lora_rank=config["lora_r"],
+        gpu_memory_utilization=0.9,
     )
-    model = FastModel.get_peft_model(
+    model = FastLanguageModel.get_peft_model(
         model,
-        finetune_vision_layers=False,
-        finetune_language_layers=True,
-        finetune_attention_modules=True,
-        finetune_mlp_modules=True,
         r=config["lora_r"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=config["lora_alpha"],
-        lora_dropout=config["lora_dropout"],
-        bias="none",
+        use_gradient_checkpointing="unsloth",
         random_state=3407,
     )
 
@@ -501,7 +494,6 @@ def run_grpo(config, train_data):
         temperature=config["grpo_temperature"],
         num_generations=config["grpo_num_generations"],
         max_completion_length=512,
-        use_vllm=False,
         learning_rate=config["grpo_learning_rate"],
         per_device_train_batch_size=config["grpo_batch_size"],
         gradient_accumulation_steps=config["grpo_grad_accum"],
@@ -532,7 +524,7 @@ def run_grpo(config, train_data):
     trainer.sampler = sampler
 
     print("\nStarting GRPO... Watch reward climb at https://wandb.ai -> connect4-llm")
-    print(f"  max_completion_length=3072 (extended thinking enabled)")
+    print(f"  max_completion_length=512 (Qwen3 thinking enabled)")
     print(f"  Curriculum: level 0→9 (easy→hard), Gaussian σ=1.5, advances at {config.get('curriculum_threshold', 0.7):.0%} ratio")
     trainer.train()
     if use_wandb:
@@ -547,7 +539,7 @@ def run_grpo(config, train_data):
 # =============================================================================
 
 def run_eval(config, eval_data):
-    from unsloth import FastModel
+    from unsloth import FastLanguageModel
     print(f"\n{'='*60}\nEVALUATION -- {config['model_size'].upper()}\n{'='*60}")
 
     checkpoint_dir = config["grpo_output"]
@@ -555,13 +547,12 @@ def run_eval(config, eval_data):
         print("ERROR: No model found")
         return
 
-    model, tokenizer = FastModel.from_pretrained(
+    model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=checkpoint_dir,
         max_seq_length=config["max_seq_length"],
-        load_in_4bit=config["load_in_4bit"],
-        load_in_8bit=config["load_in_8bit"],
+        load_in_4bit=False,
     )
-    FastModel.for_inference(model)
+    FastLanguageModel.for_inference(model)
     print(f"Evaluating on {len(eval_data)} held-out positions...")
 
     exact = 0
@@ -649,12 +640,11 @@ def run_eval(config, eval_data):
 # =============================================================================
 
 def export_model(config):
-    from unsloth import FastModel
-    model, tokenizer = FastModel.from_pretrained(
+    from unsloth import FastLanguageModel
+    model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config["grpo_output"],
         max_seq_length=config["max_seq_length"],
-        load_in_4bit=config["load_in_4bit"],
-        load_in_8bit=config["load_in_8bit"],
+        load_in_4bit=False,
     )
     model.save_pretrained_merged(config["final_model"], tokenizer, save_method="merged_16bit")
     model.save_pretrained_gguf(config["final_model"] + "-gguf", tokenizer, quantization_method="q4_k_m")
@@ -700,7 +690,7 @@ def push_to_hub(config):
 
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GRPO Training Pipeline")
-    parser.add_argument("--model", choices=["e2b-bf16", "e2b-8bit", "e4b-bf16", "e4b-8bit"], required=True)
+    parser.add_argument("--model", choices=["4b", "8b"], required=True)
     parser.add_argument("--stage", choices=["grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
