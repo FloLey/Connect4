@@ -222,6 +222,129 @@ def prepare_grpo_dataset(data, max_rows, tokenizer):
 
 
 # =============================================================================
+# SFT — teach the model the output format before GRPO
+# =============================================================================
+
+FILLER_THOUGHTS = [
+    "Thinking about this move.",
+    "Let me consider the options.",
+    "Hmm, interesting position.",
+    "I should pick carefully.",
+    "Looking at the board.",
+    "What's the best play here?",
+    "Considering my options.",
+    "Let me analyze this.",
+    "I need to decide.",
+    "Evaluating the columns.",
+    "Time to make a move.",
+    "Let me see.",
+    "Okay, let me think.",
+    "Which column is best?",
+    "Tricky position.",
+    "I think I see it.",
+    "Let me figure this out.",
+    "Alright, here goes.",
+    "Not obvious, but let me try.",
+    "What should I play?",
+]
+
+
+def prepare_sft_dataset(data, max_rows, tokenizer):
+    """Build SFT dataset that teaches: <think>generic thought</think>\\ndigit"""
+    rng = random.Random(42)
+    formatted = []
+    for entry in data[:max_rows]:
+        system_msg, user_msg = build_prompt(entry["move_sequence"])
+        thought = rng.choice(FILLER_THOUGHTS)
+        best_col = entry["best_col"]
+        conv = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+            {"role": "assistant", "content": f"<think>{thought}</think>\n{best_col}"},
+        ]
+        formatted.append({
+            "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False),
+        })
+    return Dataset.from_list(formatted)
+
+
+def run_sft(config, train_data):
+    from unsloth import FastLanguageModel
+    from trl import SFTTrainer, SFTConfig
+    print(f"\n{'='*60}\nSFT FORMAT TRAINING -- {config['model_name']}\n{'='*60}")
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=config["model_name"],
+        max_seq_length=config["max_seq_length"],
+        load_in_4bit=False,
+        fast_inference=False,
+    )
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=config["lora_r"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=config["lora_alpha"],
+        lora_dropout=0,
+        bias="none",
+        use_gradient_checkpointing="unsloth",
+        random_state=3407,
+    )
+
+    # Use 5K easy positions for SFT
+    dataset = prepare_sft_dataset(train_data[:5000], 5000, tokenizer)
+    print(f"SFT on {len(dataset)} examples (teaching format only)")
+
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        args=SFTConfig(
+            per_device_train_batch_size=8,
+            gradient_accumulation_steps=2,
+            warmup_steps=20,
+            max_steps=200,
+            learning_rate=2e-5,
+            logging_steps=10,
+            optim="adamw_8bit",
+            output_dir=config["grpo_output"] + "_sft",
+            save_steps=200,
+            max_seq_length=config["max_seq_length"],
+            dataset_text_field="text",
+        ),
+    )
+
+    print("Starting SFT... Teaching the model to output <think>...</think> + digit")
+    trainer.train()
+    model.save_pretrained(config["grpo_output"] + "_sft")
+    tokenizer.save_pretrained(config["grpo_output"] + "_sft")
+    print(f"SFT saved to {config['grpo_output']}_sft")
+
+    # Verify format compliance before moving on
+    print("\nVerifying format compliance on 50 samples...")
+    FastLanguageModel.for_inference(model)
+    correct = 0
+    total = 50
+    for entry in train_data[:total]:
+        system_msg, user_msg = build_prompt(entry["move_sequence"])
+        msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+        inputs = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            outputs = model.generate(input_ids=inputs, max_new_tokens=256, do_sample=False)
+        response = tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True)
+        if is_clean_output(response):
+            correct += 1
+    pct = 100 * correct / total
+    print(f"  Format compliance: {correct}/{total} ({pct:.0f}%)")
+
+    if pct >= 80:
+        print(f"\n>>> Format compliance {pct:.0f}% >= 80%. Starting GRPO automatically...\n")
+        return True  # Signal to start GRPO
+    else:
+        print(f"\n>>> Format compliance {pct:.0f}% < 80%. Consider more SFT steps.")
+        return False
+
+
+# =============================================================================
 # CURRICULUM LEARNING — Gaussian adaptive difficulty (10 levels)
 # =============================================================================
 
@@ -342,11 +465,11 @@ def strip_thinking(text):
 
 
 def extract_column_from_response(text):
-    """Extract column number (0-6) from model output after stripping thinking."""
-    cleaned = strip_thinking(text)
-    # Look for a single digit 0-6
-    digits = re.findall(r'[0-6]', cleaned)
-    return int(digits[0]) if digits else None
+    """Extract column number (0-6) only if output is a clean single digit."""
+    cleaned = strip_thinking(text).strip()
+    if cleaned in {"0", "1", "2", "3", "4", "5", "6"}:
+        return int(cleaned)
+    return None
 
 
 def is_clean_output(text):
@@ -399,8 +522,17 @@ def run_grpo(config, train_data):
     from trl import GRPOConfig, GRPOTrainer
     print(f"\n{'='*60}\nGRPO TRAINING -- {config['model_name']}\n{'='*60}")
 
+    # Load from SFT checkpoint if available, otherwise base model
+    sft_dir = config["grpo_output"] + "_sft"
+    if os.path.exists(sft_dir):
+        print(f"  Loading from SFT checkpoint: {sft_dir}")
+        load_model = sft_dir
+    else:
+        print("  WARNING: No SFT checkpoint found. Run --stage sft first for best results.")
+        load_model = config["model_name"]
+
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=config["model_name"],
+        model_name=load_model,
         max_seq_length=config["max_seq_length"],
         load_in_4bit=False,
         fast_inference=False,
@@ -651,7 +783,7 @@ def push_to_hub(config):
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GRPO Training Pipeline")
     parser.add_argument("--model", choices=["4b", "8b"], required=True)
-    parser.add_argument("--stage", choices=["grpo", "eval", "export", "push"], default="grpo")
+    parser.add_argument("--stage", choices=["sft", "grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
     parser.add_argument("--max-steps", type=int, default=None, help="Override max training steps (default: 2000)")
@@ -676,7 +808,10 @@ def main():
     train_data, eval_data = split_data(config["csv_path"])
     print(f"Data split: {len(train_data)} train, {len(eval_data)} eval (seed=42, no overlap)")
 
-    if args.stage == "grpo":
+    if args.stage == "sft":
+        if run_sft(config, train_data):
+            run_grpo(config, train_data)
+    elif args.stage == "grpo":
         run_grpo(config, train_data)
     elif args.stage == "eval":
         run_eval(config, eval_data)
