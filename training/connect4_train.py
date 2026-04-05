@@ -14,6 +14,12 @@ import math
 import os
 import re
 import random
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*max_new_tokens.*max_length.*")
+warnings.filterwarnings("ignore", message=".*generation_config.*deprecated.*")
+warnings.filterwarnings("ignore", message=".*attention mask is not set.*")
 
 import torch
 from datasets import Dataset
@@ -333,9 +339,9 @@ def run_sft(config, train_data):
     trainer.train()
     if use_wandb:
         wandb.finish()
-    model.save_pretrained(config["grpo_output"] + "_sft")
-    tokenizer.save_pretrained(config["grpo_output"] + "_sft")
-    print(f"SFT saved to {config['grpo_output']}_sft")
+    sft_dir = config["grpo_output"] + "_sft"
+    model.save_pretrained_merged(sft_dir, tokenizer, save_method="merged_16bit")
+    print(f"SFT merged model saved to {sft_dir}")
 
     # Verify format compliance before moving on
     print("\nVerifying format compliance on 50 samples...")
@@ -540,35 +546,23 @@ def run_grpo(config, train_data):
     from trl import GRPOConfig, GRPOTrainer
     print(f"\n{'='*60}\nGRPO TRAINING -- {config['model_name']}\n{'='*60}")
 
-    # Load from SFT checkpoint if available, otherwise base model
+    # Load from SFT merged model if available, otherwise base model
     sft_dir = config["grpo_output"] + "_sft"
-    use_sft = os.path.exists(sft_dir)
-
-    if use_sft:
-        # SFT checkpoint: merge LoRA into base, then apply fresh LoRA for GRPO
-        print(f"  Loading SFT checkpoint and merging adapters: {sft_dir}")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=config["model_name"],
-            max_seq_length=config["max_seq_length"],
-            load_in_4bit=False,
-            fast_inference=True,
-        max_lora_rank=32,
-        gpu_memory_utilization=0.6,
-        )
-        # Load and merge SFT adapters into base weights
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, sft_dir)
-        model = model.merge_and_unload()
+    if os.path.exists(sft_dir):
+        print(f"  Loading merged SFT model: {sft_dir}")
+        load_model = sft_dir
     else:
         print("  WARNING: No SFT checkpoint found. Run --stage sft first for best results.")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=config["model_name"],
-            max_seq_length=config["max_seq_length"],
-            load_in_4bit=False,
-            fast_inference=True,
-        max_lora_rank=32,
+        load_model = config["model_name"]
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=load_model,
+        max_seq_length=config["max_seq_length"],
+        load_in_4bit=False,
+        fast_inference=True,
+        max_lora_rank=config["lora_r"],
         gpu_memory_utilization=0.6,
-        )
+    )
 
     # Apply fresh LoRA for GRPO training
     model = FastLanguageModel.get_peft_model(
