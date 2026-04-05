@@ -5,6 +5,8 @@ Usage:
   python connect4_train.py --model 9b --stage push --hf-repo yourname/connect4-agent-9b
 """
 
+import unsloth  # Must be first import
+
 import argparse
 import csv
 import json
