@@ -1,5 +1,5 @@
 """
-Connect Four LLM Training Pipeline — GRPO with Unsloth (Qwen3.5)
+Connect Four LLM Training Pipeline — GRPO with Unsloth (Qwen3)
 Usage:
   python connect4_train.py --model {4b,9b} --stage {grpo,eval,export,push} --csv connect4_data.csv
   python connect4_train.py --model 9b --stage push --hf-repo yourname/connect4-agent-9b
@@ -126,8 +126,8 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "4b": {"model_name": "unsloth/Qwen3.5-4B", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
-    "9b": {"model_name": "unsloth/Qwen3.5-9B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
+    "4b": {"model_name": "unsloth/Qwen3-4B", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "8b": {"model_name": "unsloth/Qwen3-8B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
 }
 
 
@@ -395,23 +395,20 @@ class RewardCalculator:
 # =============================================================================
 
 def run_grpo(config, train_data):
-    from unsloth import FastVisionModel
+    from unsloth import FastLanguageModel
     from trl import GRPOConfig, GRPOTrainer
     print(f"\n{'='*60}\nGRPO TRAINING -- {config['model_name']}\n{'='*60}")
 
-    model, tokenizer = FastVisionModel.from_pretrained(
+    model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config["model_name"],
         max_seq_length=config["max_seq_length"],
         load_in_4bit=False,
         fast_inference=False,
     )
-    model = FastVisionModel.get_peft_model(
+    model = FastLanguageModel.get_peft_model(
         model,
-        finetune_vision_layers=False,
-        finetune_language_layers=True,
-        finetune_attention_modules=True,
-        finetune_mlp_modules=True,
         r=config["lora_r"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=config["lora_alpha"],
         lora_dropout=0,
         bias="none",
@@ -502,7 +499,7 @@ def run_grpo(config, train_data):
 # =============================================================================
 
 def run_eval(config, eval_data):
-    from unsloth import FastVisionModel
+    from unsloth import FastLanguageModel
     print(f"\n{'='*60}\nEVALUATION -- {config['model_size'].upper()}\n{'='*60}")
 
     checkpoint_dir = config["grpo_output"]
@@ -510,12 +507,12 @@ def run_eval(config, eval_data):
         print("ERROR: No model found")
         return
 
-    model, tokenizer = FastVisionModel.from_pretrained(
+    model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=checkpoint_dir,
         max_seq_length=config["max_seq_length"],
         load_in_4bit=False,
     )
-    FastVisionModel.for_inference(model)
+    FastLanguageModel.for_inference(model)
     print(f"Evaluating on {len(eval_data)} held-out positions...")
 
     exact = 0
@@ -603,8 +600,8 @@ def run_eval(config, eval_data):
 # =============================================================================
 
 def export_model(config):
-    from unsloth import FastVisionModel
-    model, tokenizer = FastVisionModel.from_pretrained(
+    from unsloth import FastLanguageModel
+    model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config["grpo_output"],
         max_seq_length=config["max_seq_length"],
         load_in_4bit=False,
@@ -653,7 +650,7 @@ def push_to_hub(config):
 
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GRPO Training Pipeline")
-    parser.add_argument("--model", choices=["4b", "9b"], required=True)
+    parser.add_argument("--model", choices=["4b", "8b"], required=True)
     parser.add_argument("--stage", choices=["grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
