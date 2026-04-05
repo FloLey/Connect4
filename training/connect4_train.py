@@ -296,6 +296,16 @@ def run_sft(config, train_data):
     dataset = prepare_sft_dataset(train_data[:5000], 5000, tokenizer)
     print(f"SFT on {len(dataset)} examples (teaching format only)")
 
+    use_wandb = config.get("use_wandb", False)
+    if use_wandb:
+        wandb.init(
+            project=config["wandb_project"],
+            name=f"sft-{config['model_size']}",
+            tags=[config["model_size"], "sft"],
+            config={"model": config["model_name"], "stage": "sft"},
+            reinit=True,
+        )
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -306,17 +316,21 @@ def run_sft(config, train_data):
             warmup_steps=20,
             max_steps=200,
             learning_rate=2e-5,
-            logging_steps=10,
+            logging_steps=1,
             optim="adamw_8bit",
             output_dir=config["grpo_output"] + "_sft",
             save_steps=200,
             max_seq_length=config["max_seq_length"],
             dataset_text_field="text",
+            report_to="wandb" if use_wandb else "none",
+            run_name=f"sft-{config['model_size']}",
         ),
     )
 
     print("Starting SFT... Teaching the model to output <think>...</think> + digit")
     trainer.train()
+    if use_wandb:
+        wandb.finish()
     model.save_pretrained(config["grpo_output"] + "_sft")
     tokenizer.save_pretrained(config["grpo_output"] + "_sft")
     print(f"SFT saved to {config['grpo_output']}_sft")
