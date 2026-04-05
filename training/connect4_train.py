@@ -496,7 +496,6 @@ def run_grpo(config, train_data):
         output_dir=config["grpo_output"],
         temperature=config["grpo_temperature"],
         num_generations=config["grpo_num_generations"],
-        max_prompt_length=512,
         max_completion_length=3072,
         learning_rate=config["grpo_learning_rate"],
         per_device_train_batch_size=config["grpo_batch_size"],
