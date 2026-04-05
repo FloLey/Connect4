@@ -279,7 +279,9 @@ def run_sft(config, train_data):
         model_name=config["model_name"],
         max_seq_length=config["max_seq_length"],
         load_in_4bit=False,
-        fast_inference=False,
+        fast_inference=True,
+        max_lora_rank=32,
+        gpu_memory_utilization=0.6,
     )
     model = FastLanguageModel.get_peft_model(
         model,
@@ -549,7 +551,9 @@ def run_grpo(config, train_data):
             model_name=config["model_name"],
             max_seq_length=config["max_seq_length"],
             load_in_4bit=False,
-            fast_inference=False,
+            fast_inference=True,
+        max_lora_rank=32,
+        gpu_memory_utilization=0.6,
         )
         # Load and merge SFT adapters into base weights
         from peft import PeftModel
@@ -561,7 +565,9 @@ def run_grpo(config, train_data):
             model_name=config["model_name"],
             max_seq_length=config["max_seq_length"],
             load_in_4bit=False,
-            fast_inference=False,
+            fast_inference=True,
+        max_lora_rank=32,
+        gpu_memory_utilization=0.6,
         )
 
     # Apply fresh LoRA for GRPO training
