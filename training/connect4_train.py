@@ -5,6 +5,8 @@ Usage:
   python connect4_train.py --model e4b-bf16 --stage push --hf-repo yourname/connect4-agent-e4b-bf16
 """
 
+import unsloth  # Must be imported first to apply training optimizations
+
 import argparse
 import csv
 import json

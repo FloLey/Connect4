@@ -26,22 +26,20 @@ No SFT needed — Gemma 4 already knows JSON and has native thinking (`<|think|>
 
 ## Step 1: Pod Setup
 
+**Template:** Use `unsloth/unsloth:latest` on RunPod (has all dependencies pre-installed).
+
 On **each pod**, run:
 
 ```bash
-# Install dependencies
-pip install unsloth wandb diffusers huggingface_hub
+# Clone the repo
+git clone https://github.com/FloLey/Connect4.git
+cd Connect4/training
+
+# Install wandb (only extra dependency needed)
+pip install wandb
 
 # Login to wandb (paste your API key when prompted)
 wandb login
-
-# Login to HuggingFace (paste your token when prompted)
-huggingface-cli login
-
-# Upload your files (or git clone your repo)
-# Make sure these are in the working directory:
-#   - connect4_train.py
-#   - connect4_data.csv
 ```
 
 ---
