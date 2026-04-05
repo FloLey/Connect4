@@ -1,5 +1,5 @@
 """
-Connect Four LLM Training Pipeline — GRPO with Unsloth (Qwen3)
+Connect Four LLM Training Pipeline — GRPO with Unsloth (Ministral 3)
 Usage:
   python connect4_train.py --model {4b,9b} --stage {grpo,eval,export,push} --csv connect4_data.csv
   python connect4_train.py --model 9b --stage push --hf-repo yourname/connect4-agent-9b
@@ -134,8 +134,8 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "4b": {"model_name": "unsloth/Qwen3-4B", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
-    "8b": {"model_name": "unsloth/Qwen3-8B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
+    "3b": {"model_name": "unsloth/Ministral-3-3B-Instruct-2512", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "8b": {"model_name": "unsloth/Ministral-3-8B-Instruct-2512", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
 }
 
 
@@ -480,11 +480,11 @@ class CurriculumCallback(TrainerCallback):
 
 
 # =============================================================================
-# OUTPUT PARSING (handles Qwen3 <think> blocks, expects single digit 0-6)
+# OUTPUT PARSING (handles <think> blocks, expects single digit 0-6)
 # =============================================================================
 
 def strip_thinking(text):
-    """Remove <think>...</think> blocks from Qwen3 output."""
+    """Remove <think>...</think> blocks from output."""
     return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
 
@@ -644,7 +644,7 @@ def run_grpo(config, train_data):
     trainer.sampler = sampler
 
     print("\nStarting GRPO... Watch reward climb at https://wandb.ai -> connect4-llm")
-    print(f"  max_completion_length=512 (Qwen3 thinking enabled)")
+    print(f"  max_completion_length=512 (thinking enabled via SFT)")
     print(f"  Curriculum: level 0→9 (easy→hard), Gaussian σ=1.5, advances at {config.get('curriculum_threshold', 0.7):.0%} ratio")
     trainer.train()
     if use_wandb:
@@ -810,7 +810,7 @@ def push_to_hub(config):
 
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GRPO Training Pipeline")
-    parser.add_argument("--model", choices=["4b", "8b"], required=True)
+    parser.add_argument("--model", choices=["3b", "8b"], required=True)
     parser.add_argument("--stage", choices=["sft", "grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
