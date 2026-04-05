@@ -292,8 +292,8 @@ def run_sft(config, train_data):
         random_state=3407,
     )
 
-    # Use 5K easy positions for SFT
-    dataset = prepare_sft_dataset(train_data[:5000], 5000, tokenizer)
+    # 40 steps × batch 16 = 640 examples needed, use 1000 for margin
+    dataset = prepare_sft_dataset(train_data[:1000], 1000, tokenizer)
     print(f"SFT on {len(dataset)} examples (teaching format only)")
 
     use_wandb = config.get("use_wandb", False)
