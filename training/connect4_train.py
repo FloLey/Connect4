@@ -1,8 +1,8 @@
 """
-Connect Four LLM Training Pipeline — GRPO with Unsloth (Qwen3)
+Connect Four LLM Training Pipeline — GRPO with Unsloth (Qwen3.5)
 Usage:
-  python connect4_train.py --model {4b,8b} --stage {grpo,eval,export,push} --csv connect4_data.csv
-  python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
+  python connect4_train.py --model {4b,9b} --stage {grpo,eval,export,push} --csv connect4_data.csv
+  python connect4_train.py --model 9b --stage push --hf-repo yourname/connect4-agent-9b
 """
 
 import argparse
@@ -94,25 +94,11 @@ def reconstruct_board(move_sequence):
 # PRODUCTION PROMPT TEMPLATES (mirrors backend/app/engine/ai.py)
 # =============================================================================
 
-SYSTEM_TEMPLATE = """You are an expert Connect Four player engine.
-You are Player {player_id} (Symbol: {symbol}).
-Opponent is Player {opponent_id} (Symbol: {opp_symbol}).
-Board: 6 Rows x 7 Columns.
-Goal: Connect 4 pieces in a row (Horizontal, Vertical, Diagonal).
-Gravity: Pieces fall to the lowest empty slot.
-"""
+SYSTEM_TEMPLATE = """You are an expert Connect Four player. Board: 6 rows x 7 columns. Gravity: pieces fall to lowest empty slot. Goal: connect 4 in a row. You are Player {player_id} ({symbol}). Reply with just the column number (0-6)."""
 
-USER_TEMPLATE = """
-Board (Visual):
-{visual_board}
+USER_TEMPLATE = """{visual_board}
 
-Board (Textual):
-{textual_board}
-
-Valid Columns: {valid_moves}
-
-Analyze the board state carefully. Output valid JSON.
-"""
+Valid columns: {valid_moves}"""
 
 
 def build_prompt(move_sequence):
@@ -141,8 +127,8 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "4b": {"model_name": "unsloth/Qwen3-4B-Base", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
-    "8b": {"model_name": "unsloth/Qwen3-8B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
+    "4b": {"model_name": "unsloth/Qwen3.5-4B", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "9b": {"model_name": "unsloth/Qwen3.5-9B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
 }
 
 
@@ -348,7 +334,7 @@ class CurriculumCallback(TrainerCallback):
 
 
 # =============================================================================
-# OUTPUT PARSING (handles Qwen3 <think> blocks + JSON)
+# OUTPUT PARSING (handles Qwen3 <think> blocks, expects single digit 0-6)
 # =============================================================================
 
 def strip_thinking(text):
@@ -357,42 +343,17 @@ def strip_thinking(text):
 
 
 def extract_column_from_response(text):
-    """Multi-strategy column extraction: JSON → regex → last digit."""
+    """Extract column number (0-6) from model output after stripping thinking."""
     cleaned = strip_thinking(text)
-    # Strategy 1: full JSON parse
-    try:
-        data = json.loads(cleaned)
-        col = data.get("column")
-        if isinstance(col, int) and 0 <= col <= 6:
-            return col
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    # Strategy 2: regex for "column": N
-    match = re.search(r'"column"\s*:\s*(\d)', cleaned)
-    if match:
-        col = int(match.group(1))
-        if 0 <= col <= 6:
-            return col
-    # Strategy 3: last digit 0-6
+    # Look for a single digit 0-6
     digits = re.findall(r'[0-6]', cleaned)
-    return int(digits[-1]) if digits else None
+    return int(digits[0]) if digits else None
 
 
-def classify_format(text):
-    """Classify output quality: 'json', 'regex', 'digit', or 'invalid'."""
+def is_clean_output(text):
+    """Check if the output (after thinking) is just a single digit 0-6."""
     cleaned = strip_thinking(text)
-    try:
-        data = json.loads(cleaned)
-        col = data.get("column")
-        if isinstance(col, int) and 0 <= col <= 6:
-            return "json"
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    if re.search(r'"column"\s*:\s*(\d)', cleaned):
-        return "regex"
-    if re.findall(r'[0-6]', cleaned):
-        return "digit"
-    return "invalid"
+    return cleaned.strip() in {"0", "1", "2", "3", "4", "5", "6"}
 
 
 # =============================================================================
@@ -407,11 +368,10 @@ class RewardCalculator:
         self.max_reward_log = []
 
     def reward_format(self, completions, **kwargs):
-        """Reward for producing valid structured output."""
+        """Reward for outputting just a single digit 0-6."""
         rewards = []
         for c in completions:
-            fmt = classify_format(c)
-            rewards.append(1.0 if fmt == "json" else -10.0)
+            rewards.append(1.0 if is_clean_output(c) else -10.0)
         return rewards
 
     def reward_move_quality(self, completions, move_sequence, max_reward=None, **kwargs):
@@ -690,7 +650,7 @@ def push_to_hub(config):
 
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GRPO Training Pipeline")
-    parser.add_argument("--model", choices=["4b", "8b"], required=True)
+    parser.add_argument("--model", choices=["4b", "9b"], required=True)
     parser.add_argument("--stage", choices=["grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
