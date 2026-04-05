@@ -1,8 +1,8 @@
 """
-Connect Four LLM Training Pipeline — GRPO with Unsloth (Qwen3.5)
+Connect Four LLM Training Pipeline — GRPO with Unsloth (Qwen3)
 Usage:
-  python connect4_train.py --model {4b,9b} --stage {grpo,eval,export,push} --csv connect4_data.csv
-  python connect4_train.py --model 9b --stage push --hf-repo yourname/connect4-agent-9b
+  python connect4_train.py --model {4b,8b} --stage {grpo,eval,export,push} --csv connect4_data.csv
+  python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
 """
 
 import argparse
@@ -11,8 +11,15 @@ import json
 import os
 import re
 import random
-
+import sys
+import types
 import math
+
+# Prevent trl from crashing on missing mergekit/llm_blender
+for _mod in ["mergekit", "mergekit.config", "mergekit.merge", "mergekit.card",
+             "mergekit.merge_methods", "llm_blender"]:
+    if _mod not in sys.modules:
+        sys.modules[_mod] = types.ModuleType(_mod)
 
 import torch
 from datasets import Dataset
@@ -127,8 +134,8 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "4b": {"model_name": "unsloth/Qwen3.5-4B", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
-    "9b": {"model_name": "unsloth/Qwen3.5-9B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
+    "4b": {"model_name": "unsloth/Qwen3-4B", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "8b": {"model_name": "unsloth/Qwen3-8B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
 }
 
 
@@ -650,7 +657,7 @@ def push_to_hub(config):
 
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GRPO Training Pipeline")
-    parser.add_argument("--model", choices=["4b", "9b"], required=True)
+    parser.add_argument("--model", choices=["4b", "8b"], required=True)
     parser.add_argument("--stage", choices=["grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
