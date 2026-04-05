@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use crate::book::OpeningBook;
 use crate::board::{bit_index, Board, COLS, ROWS};
 
 const MOVE_ORDER: [u32; 7] = [3, 4, 2, 5, 1, 6, 0];
@@ -10,12 +13,12 @@ const MAX_SCORE: i32 = ((COLS * ROWS) as i32 + 1) / 2 - 3; // 18
 /// - Upper bound stored as: alpha - MIN_SCORE + 1 (range 1..37)
 /// - Lower bound stored as: score + MAX_SCORE - 2*MIN_SCORE + 2 (range 38..74)
 /// - 0 = empty
-/// Uses full 64-bit keys to eliminate false-positive collisions, with power-of-two
-/// size for O(1) bitwise indexing (~9 bytes/entry: u64 key + u8 value).
+/// Full 64-bit keys for correctness, power-of-two size for O(1) indexing.
+/// Size chosen to fit in L3 cache (~18MB for 2^21 entries).
 pub struct TranspositionTable {
     keys: Vec<u64>,
     values: Vec<u8>,
-    mask: usize, // size - 1; size must be a power of two
+    mask: usize,
 }
 
 impl TranspositionTable {
@@ -29,19 +32,14 @@ impl TranspositionTable {
     }
 
     #[inline(always)]
-    fn index(&self, key: u64) -> usize {
-        (key as usize) & self.mask
-    }
-
-    #[inline(always)]
     pub fn get(&self, key: u64) -> u8 {
-        let idx = self.index(key);
+        let idx = (key as usize) & self.mask;
         if self.keys[idx] == key { self.values[idx] } else { 0 }
     }
 
     #[inline(always)]
     pub fn put(&mut self, key: u64, value: u8) {
-        let idx = self.index(key);
+        let idx = (key as usize) & self.mask;
         self.keys[idx] = key;
         self.values[idx] = value;
     }
@@ -54,16 +52,58 @@ impl TranspositionTable {
 }
 
 pub struct Solver {
-    pub table: TranspositionTable,
+    // Hot fields first — all fit in one cache line (40 bytes).
+    // negamax accesses all of these on every call.
     pub node_count: u64,
+    pub tt_hits: u64,
+    pub tt_useful: u64,
+    pub total_moves: u64,
+    pub book: Option<Arc<OpeningBook>>,  // 8 bytes (null = None via niche opt)
+    // Cold: only accessed via pointer dereference (heap data)
+    pub table: TranspositionTable,
 }
 
 impl Solver {
     pub fn new() -> Self {
         Solver {
-            // 2^24 = 16,777,216 entries × 9 bytes = ~150MB per thread
-            table: TranspositionTable::new(1 << 24),
+            // 2^24 = 16,777,216 entries × 9 bytes = ~150MB use
+            table: TranspositionTable::new(1 << 21),
             node_count: 0,
+            book: None,
+            tt_hits: 0,
+            tt_useful: 0,
+            total_moves: 0,
+        }
+    }
+
+    pub fn with_book(book: Arc<OpeningBook>) -> Self {
+        Solver {
+            table: TranspositionTable::new(1 << 21),
+            node_count: 0,
+            book: Some(book),
+            tt_hits: 0,
+            tt_useful: 0,
+            total_moves: 0,
+        }
+    }
+
+    pub fn reset_diagnostics(&mut self) {
+        self.node_count = 0;
+        self.tt_hits = 0;
+        self.tt_useful = 0;
+        self.total_moves = 0;
+    }
+
+    /// Solver for opening book building.
+    /// Uses 2^24 = 16M entries (~144MB) per thread.
+    pub fn for_book() -> Self {
+        Solver {
+            table: TranspositionTable::new(1 << 19),
+            node_count: 0,
+            book: None,
+            tt_hits: 0,
+            tt_useful: 0,
+            total_moves: 0,
         }
     }
 
@@ -121,6 +161,13 @@ impl Solver {
             return 0;
         }
 
+        // Opening book: exact score, no search needed
+        if let Some(book) = &self.book {
+            if let Some(score) = book.get(board.key()) {
+                return score;
+            }
+        }
+
         // Pre-compute legal moves, current and opponent winning positions once per node
         let (legal, winning_cur, winning_opp) = board.precompute_threats();
 
@@ -156,16 +203,17 @@ impl Solver {
         let key = board.key();
         let val = self.table.get(key);
         if val != 0 {
+            self.tt_hits += 1;
             if val > (MAX_SCORE - MIN_SCORE + 1) as u8 {
                 // Lower bound
                 let lb = val as i32 + 2 * MIN_SCORE - MAX_SCORE - 2;
                 if lb >= beta { return lb; }
-                if lb > alpha { alpha = lb; }
+                if lb > alpha { self.tt_useful += 1; alpha = lb; }
             } else {
                 // Upper bound
                 let ub = val as i32 + MIN_SCORE - 1;
                 if ub <= alpha { return ub; }
-                if ub < beta { beta = ub; }
+                if ub < beta { self.tt_useful += 1; beta = ub; }
             }
         }
 
@@ -195,6 +243,7 @@ impl Solver {
             }
         }
 
+        self.total_moves += n_moves as u64;
         for i in 0..n_moves {
             let col = move_entries[i].0;
             board.play(col);
