@@ -286,7 +286,7 @@ def run_sft(config, train_data):
         max_seq_length=config["max_seq_length"],
         load_in_4bit=False,
         fast_inference=True,
-        max_lora_rank=32,
+        max_lora_rank=config["lora_r"],
         gpu_memory_utilization=0.6,
     )
     model = FastLanguageModel.get_peft_model(
