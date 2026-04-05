@@ -1,25 +1,17 @@
 """
-Connect Four LLM Training Pipeline — GRPO with Unsloth (Qwen3)
+Connect Four LLM Training Pipeline — GRPO with Unsloth (Qwen3.5)
 Usage:
-  python connect4_train.py --model {4b,8b} --stage {grpo,eval,export,push} --csv connect4_data.csv
-  python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
+  python connect4_train.py --model {4b,9b} --stage {grpo,eval,export,push} --csv connect4_data.csv
+  python connect4_train.py --model 9b --stage push --hf-repo yourname/connect4-agent-9b
 """
 
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import random
-import sys
-import types
-import math
-
-# Prevent trl from crashing on missing mergekit/llm_blender
-for _mod in ["mergekit", "mergekit.config", "mergekit.merge", "mergekit.card",
-             "mergekit.merge_methods", "llm_blender"]:
-    if _mod not in sys.modules:
-        sys.modules[_mod] = types.ModuleType(_mod)
 
 import torch
 from datasets import Dataset
@@ -134,8 +126,8 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "4b": {"model_name": "unsloth/Qwen3-4B", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
-    "8b": {"model_name": "unsloth/Qwen3-8B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
+    "4b": {"model_name": "unsloth/Qwen3.5-4B", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "9b": {"model_name": "unsloth/Qwen3.5-9B", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
 }
 
 
@@ -403,8 +395,6 @@ class RewardCalculator:
 # =============================================================================
 
 def run_grpo(config, train_data):
-    import os
-    os.environ["UNSLOTH_VLLM_STANDBY"] = "1"  # Saves 30%+ memory for RL
     from unsloth import FastLanguageModel
     from trl import GRPOConfig, GRPOTrainer
     print(f"\n{'='*60}\nGRPO TRAINING -- {config['model_name']}\n{'='*60}")
@@ -413,15 +403,15 @@ def run_grpo(config, train_data):
         model_name=config["model_name"],
         max_seq_length=config["max_seq_length"],
         load_in_4bit=False,
-        fast_inference=True,
-        max_lora_rank=config["lora_r"],
-        gpu_memory_utilization=0.9,
+        fast_inference=False,
     )
     model = FastLanguageModel.get_peft_model(
         model,
         r=config["lora_r"],
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=config["lora_alpha"],
+        lora_dropout=0,
+        bias="none",
         use_gradient_checkpointing="unsloth",
         random_state=3407,
     )
@@ -458,24 +448,27 @@ def run_grpo(config, train_data):
 
     grpo_kwargs = dict(
         output_dir=config["grpo_output"],
-        temperature=config["grpo_temperature"],
-        num_generations=config["grpo_num_generations"],
-        max_completion_length=512,
-        learning_rate=config["grpo_learning_rate"],
-        per_device_train_batch_size=config["grpo_batch_size"],
-        gradient_accumulation_steps=config["grpo_grad_accum"],
-        max_steps=config["grpo_max_steps"],
-        weight_decay=0.01,
-        warmup_ratio=0.05,
+        learning_rate=5e-6,
+        adam_beta1=0.9,
+        adam_beta2=0.99,
+        weight_decay=0.1,
+        warmup_ratio=0.1,
         lr_scheduler_type="cosine",
         optim="adamw_8bit",
         logging_steps=1,
+        per_device_train_batch_size=config["grpo_batch_size"],
+        gradient_accumulation_steps=config["grpo_grad_accum"],
+        num_generations=config["grpo_num_generations"],
+        max_prompt_length=512,
+        max_completion_length=512,
+        max_steps=config["grpo_max_steps"],
         save_steps=300,
+        max_grad_norm=0.1,
         report_to="wandb" if use_wandb else "none",
         run_name=run_name,
+        loss_type=config.get("grpo_loss_type") or "dr_grpo",
+        mask_truncated_completions=False,
     )
-    if config.get("grpo_loss_type"):
-        grpo_kwargs["loss_type"] = config["grpo_loss_type"]
 
     trainer = GRPOTrainer(
         model=model,
@@ -657,7 +650,7 @@ def push_to_hub(config):
 
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GRPO Training Pipeline")
-    parser.add_argument("--model", choices=["4b", "8b"], required=True)
+    parser.add_argument("--model", choices=["4b", "9b"], required=True)
     parser.add_argument("--stage", choices=["grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
