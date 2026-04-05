@@ -162,7 +162,6 @@ def get_config(model_size):
         "lora_r": mc["lora_r"],
         "lora_alpha": mc["lora_r"],
         "lora_dropout": 0,
-        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         "grpo_learning_rate": 1e-5,
         "grpo_max_steps": 2000,
         "grpo_batch_size": mc["grpo_batch_size"],
@@ -456,10 +455,15 @@ def run_grpo(config, train_data):
     )
     model = FastModel.get_peft_model(
         model,
+        finetune_vision_layers=False,
+        finetune_language_layers=True,
+        finetune_attention_modules=True,
+        finetune_mlp_modules=True,
         r=config["lora_r"],
         lora_alpha=config["lora_alpha"],
         lora_dropout=config["lora_dropout"],
-        target_modules=config["target_modules"],
+        bias="none",
+        random_state=3407,
     )
 
     reward_calc = RewardCalculator(train_data)
