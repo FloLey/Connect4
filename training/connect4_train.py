@@ -395,20 +395,23 @@ class RewardCalculator:
 # =============================================================================
 
 def run_grpo(config, train_data):
-    from unsloth import FastLanguageModel
+    from unsloth import FastVisionModel
     from trl import GRPOConfig, GRPOTrainer
     print(f"\n{'='*60}\nGRPO TRAINING -- {config['model_name']}\n{'='*60}")
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    model, tokenizer = FastVisionModel.from_pretrained(
         model_name=config["model_name"],
         max_seq_length=config["max_seq_length"],
         load_in_4bit=False,
         fast_inference=False,
     )
-    model = FastLanguageModel.get_peft_model(
+    model = FastVisionModel.get_peft_model(
         model,
+        finetune_vision_layers=False,
+        finetune_language_layers=True,
+        finetune_attention_modules=True,
+        finetune_mlp_modules=True,
         r=config["lora_r"],
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         lora_alpha=config["lora_alpha"],
         lora_dropout=0,
         bias="none",
@@ -499,7 +502,7 @@ def run_grpo(config, train_data):
 # =============================================================================
 
 def run_eval(config, eval_data):
-    from unsloth import FastLanguageModel
+    from unsloth import FastVisionModel
     print(f"\n{'='*60}\nEVALUATION -- {config['model_size'].upper()}\n{'='*60}")
 
     checkpoint_dir = config["grpo_output"]
@@ -507,12 +510,12 @@ def run_eval(config, eval_data):
         print("ERROR: No model found")
         return
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    model, tokenizer = FastVisionModel.from_pretrained(
         model_name=checkpoint_dir,
         max_seq_length=config["max_seq_length"],
         load_in_4bit=False,
     )
-    FastLanguageModel.for_inference(model)
+    FastVisionModel.for_inference(model)
     print(f"Evaluating on {len(eval_data)} held-out positions...")
 
     exact = 0
@@ -600,8 +603,8 @@ def run_eval(config, eval_data):
 # =============================================================================
 
 def export_model(config):
-    from unsloth import FastLanguageModel
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    from unsloth import FastVisionModel
+    model, tokenizer = FastVisionModel.from_pretrained(
         model_name=config["grpo_output"],
         max_seq_length=config["max_seq_length"],
         load_in_4bit=False,
