@@ -314,7 +314,7 @@ def run_sft(config, train_data):
             per_device_train_batch_size=8,
             gradient_accumulation_steps=2,
             warmup_steps=20,
-            max_steps=200,
+            max_steps=40,
             learning_rate=2e-5,
             logging_steps=1,
             optim="adamw_8bit",
@@ -345,7 +345,7 @@ def run_sft(config, train_data):
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
         inputs = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(model.device)
         with torch.no_grad():
-            outputs = model.generate(input_ids=inputs, max_new_tokens=256, do_sample=False)
+            outputs = model.generate(input_ids=inputs, max_new_tokens=512, do_sample=False)
         response = tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True)
         if is_clean_output(response):
             correct += 1
@@ -692,7 +692,7 @@ def run_eval(config, eval_data):
         ).to(model.device)
 
         with torch.no_grad():
-            outputs = model.generate(input_ids=inputs, max_new_tokens=3072, do_sample=False)
+            outputs = model.generate(input_ids=inputs, max_new_tokens=512, do_sample=False)
         response = tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True)
         col = extract_column_from_response(response)
 
