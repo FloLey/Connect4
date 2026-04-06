@@ -334,10 +334,13 @@ def run_sft(config, train_data):
     for entry in train_data[:total]:
         system_msg, user_msg = build_prompt(entry["move_sequence"])
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-        input_ids = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt")
-        if isinstance(input_ids, dict):
-            input_ids = input_ids["input_ids"]
-        input_ids = input_ids.to(merged.device)
+        encoded = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt")
+        if hasattr(encoded, "input_ids"):
+            input_ids = encoded.input_ids.to(merged.device)
+        elif isinstance(encoded, dict):
+            input_ids = encoded["input_ids"].to(merged.device)
+        else:
+            input_ids = encoded.to(merged.device)
         with torch.no_grad():
             outputs = merged.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
         response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
