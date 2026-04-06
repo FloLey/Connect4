@@ -306,7 +306,7 @@ def run_sft(config, train_data):
             optim="adamw_8bit",
             output_dir=config["grpo_output"] + "_sft",
             save_steps=50,
-            max_seq_length=config["max_seq_length"],
+            max_length=config["max_seq_length"],
             dataset_text_field="text",
             report_to="wandb" if use_wandb else "none",
             run_name=f"sft-{config['model_size']}",
