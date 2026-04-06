@@ -114,8 +114,8 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "3b": {"model_name": "mistralai/Ministral-3B-Instruct-2506", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 1, "grpo_grad_accum": 2},
-    "8b": {"model_name": "mistralai/Ministral-8B-Instruct-2410", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 1, "grpo_grad_accum": 4},
+    "3b": {"model_name": "mistralai/Ministral-3-3B-Instruct-2512", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 1, "grpo_grad_accum": 2},
+    "8b": {"model_name": "mistralai/Ministral-3-8B-Instruct-2512", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 1, "grpo_grad_accum": 4},
 }
 
 
