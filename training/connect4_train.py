@@ -1,11 +1,9 @@
 """
-Connect Four LLM Training Pipeline — GRPO with Unsloth (Ministral 3)
+Connect Four LLM Training Pipeline — GRPO with trl + vLLM (Ministral 3)
 Usage:
-  python connect4_train.py --model {4b,9b} --stage {grpo,eval,export,push} --csv connect4_data.csv
-  python connect4_train.py --model 9b --stage push --hf-repo yourname/connect4-agent-9b
+  python connect4_train.py --model {3b,8b} --stage {sft,grpo,eval,export,push} --csv connect4_data.csv
+  python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
 """
-
-import unsloth  # Must be first import
 
 import argparse
 import csv
@@ -24,7 +22,8 @@ warnings.filterwarnings("ignore", message=".*attention mask is not set.*")
 import torch
 from datasets import Dataset
 from torch.utils.data import Sampler
-from transformers import TrainerCallback
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
+from peft import LoraConfig, get_peft_model, PeftModel
 
 try:
     import wandb
@@ -75,19 +74,6 @@ class ConnectFour:
             rows_str.append("|" + "|".join(row_cells) + "|")
         return header + "\n" + "\n".join(rows_str)
 
-    def get_textual_description(self):
-        lines = []
-        for c in range(COLS):
-            pieces = []
-            for r in range(ROWS - 1, -1, -1):
-                val = self.board[r][c]
-                if val == 0:
-                    break
-                pieces.append("P1" if val == 1 else "P2")
-            desc = ", ".join(pieces) if pieces else "Empty"
-            lines.append(f"Column {c}: {desc}")
-        return "\n".join(lines)
-
 
 def reconstruct_board(move_sequence):
     """Replay a move_sequence string into a ConnectFour board."""
@@ -98,7 +84,7 @@ def reconstruct_board(move_sequence):
 
 
 # =============================================================================
-# PRODUCTION PROMPT TEMPLATES (mirrors backend/app/engine/ai.py)
+# PRODUCTION PROMPT TEMPLATES
 # =============================================================================
 
 SYSTEM_TEMPLATE = """You are an expert Connect Four player. Board: 6 rows x 7 columns. Gravity: pieces fall to lowest empty slot. Goal: connect 4 in a row. You are Player {player_id} ({symbol}). Reply with just the column number (0-6)."""
@@ -109,33 +95,27 @@ Valid columns: {valid_moves}"""
 
 
 def build_prompt(move_sequence):
-    """Build (system_msg, user_msg) matching production format exactly."""
+    """Build (system_msg, user_msg) for a given board position."""
     game = reconstruct_board(move_sequence)
     num_moves = len(move_sequence)
     player_id = 1 if num_moves % 2 == 0 else 2
-    opponent_id = 2 if player_id == 1 else 1
     symbol = "X" if player_id == 1 else "O"
-    opp_symbol = "O" if player_id == 1 else "X"
 
-    system_msg = SYSTEM_TEMPLATE.format(
-        player_id=player_id, symbol=symbol,
-        opponent_id=opponent_id, opp_symbol=opp_symbol,
-    )
+    system_msg = SYSTEM_TEMPLATE.format(player_id=player_id, symbol=symbol)
     user_msg = USER_TEMPLATE.format(
         visual_board=game.get_visual_board(),
-        textual_board=game.get_textual_description(),
         valid_moves=game.get_valid_moves(),
     )
     return system_msg, user_msg
 
 
 # =============================================================================
-# MODEL CONFIGS (reduced num_generations for longer completions)
+# MODEL CONFIGS
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "3b": {"model_name": "unsloth/Ministral-3-3B-Instruct-2512", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
-    "8b": {"model_name": "unsloth/Ministral-3-8B-Instruct-2512", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 2, "grpo_grad_accum": 4},
+    "3b": {"model_name": "mistralai/Ministral-3B-Instruct-2506", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 1, "grpo_grad_accum": 2},
+    "8b": {"model_name": "mistralai/Ministral-8B-Instruct-2410", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 1, "grpo_grad_accum": 4},
 }
 
 
@@ -147,13 +127,10 @@ def get_config(model_size):
         "max_seq_length": 2048,
         "lora_r": mc["lora_r"],
         "lora_alpha": mc["lora_r"] * 2,
-        "lora_dropout": 0,
-        "grpo_learning_rate": 1e-5,
         "grpo_max_steps": 2000,
         "grpo_batch_size": mc["grpo_batch_size"],
         "grpo_grad_accum": mc["grpo_grad_accum"],
         "grpo_num_generations": mc["grpo_num_generations"],
-        "grpo_temperature": 0.7,
         "grpo_max_rows": 200_000,
         "csv_path": "connect4_data.csv",
         "grpo_output": f"outputs_grpo_{model_size}",
@@ -184,22 +161,17 @@ def build_lookup_table(data):
 
 
 def difficulty_score(entry):
-    """How hard is this position? Higher std = easier (clearer good vs bad moves).
-
-    Returns negative std so sorted(..., reverse=True) puts easy first.
-    """
+    """Higher std = easier. Returns negative std so reverse sort puts easy first."""
     scores = entry["scores"]
     mean = sum(scores) / len(scores)
     return -(sum((s - mean) ** 2 for s in scores) / len(scores)) ** 0.5
 
 
 def sort_by_difficulty(data):
-    """Sort positions from easiest (obvious best move) to hardest (ambiguous)."""
     return sorted(data, key=difficulty_score, reverse=True)
 
 
 def split_data(csv_path):
-    """Single deterministic train/eval split to prevent data leakage."""
     raw_data = load_csv_data(csv_path)
     random.seed(42)
     random.shuffle(raw_data)
@@ -209,7 +181,7 @@ def split_data(csv_path):
 
 
 # =============================================================================
-# GRPO DATASET
+# DATASETS
 # =============================================================================
 
 def prepare_grpo_dataset(data, max_rows, tokenizer):
@@ -229,36 +201,21 @@ def prepare_grpo_dataset(data, max_rows, tokenizer):
     return Dataset.from_list(formatted)
 
 
-# =============================================================================
-# SFT — teach the model the output format before GRPO
-# =============================================================================
-
 FILLER_THOUGHTS = [
-    "Thinking about this move.",
-    "Let me consider the options.",
-    "Hmm, interesting position.",
-    "I should pick carefully.",
-    "Looking at the board.",
-    "What's the best play here?",
-    "Considering my options.",
-    "Let me analyze this.",
-    "I need to decide.",
-    "Evaluating the columns.",
-    "Time to make a move.",
-    "Let me see.",
-    "Okay, let me think.",
-    "Which column is best?",
-    "Tricky position.",
-    "I think I see it.",
-    "Let me figure this out.",
-    "Alright, here goes.",
-    "Not obvious, but let me try.",
-    "What should I play?",
+    "Thinking about this move.", "Let me consider the options.",
+    "Hmm, interesting position.", "I should pick carefully.",
+    "Looking at the board.", "What's the best play here?",
+    "Considering my options.", "Let me analyze this.",
+    "I need to decide.", "Evaluating the columns.",
+    "Time to make a move.", "Let me see.",
+    "Okay, let me think.", "Which column is best?",
+    "Tricky position.", "I think I see it.",
+    "Let me figure this out.", "Alright, here goes.",
+    "Not obvious, but let me try.", "What should I play?",
 ]
 
 
 def prepare_sft_dataset(data, max_rows, tokenizer):
-    """Build SFT dataset that teaches: <think>generic thought</think>\\ndigit"""
     rng = random.Random(42)
     formatted = []
     for entry in data[:max_rows]:
@@ -276,31 +233,45 @@ def prepare_sft_dataset(data, max_rows, tokenizer):
     return Dataset.from_list(formatted)
 
 
+# =============================================================================
+# SFT — teach the model the output format before GRPO
+# =============================================================================
+
+def load_model_and_tokenizer(model_name):
+    """Load model and tokenizer with standard HF stack."""
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return model, tokenizer
+
+
+def apply_lora(model, config):
+    """Apply LoRA adapters to the model."""
+    lora_config = LoraConfig(
+        r=config["lora_r"],
+        lora_alpha=config["lora_alpha"],
+        lora_dropout=0,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    model.gradient_checkpointing_enable()
+    return model
+
+
 def run_sft(config, train_data):
-    from unsloth import FastLanguageModel
     from trl import SFTTrainer, SFTConfig
     print(f"\n{'='*60}\nSFT FORMAT TRAINING -- {config['model_name']}\n{'='*60}")
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=config["model_name"],
-        max_seq_length=config["max_seq_length"],
-        load_in_4bit=False,
-        fast_inference=True,
-        max_lora_rank=config["lora_r"],
-        gpu_memory_utilization=0.6,
-    )
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=config["lora_r"],
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=config["lora_alpha"],
-        lora_dropout=0,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=3407,
-    )
+    model, tokenizer = load_model_and_tokenizer(config["model_name"])
+    model = apply_lora(model, config)
 
-    # 40 steps × batch 16 = 640 examples needed, use 1000 for margin
     dataset = prepare_sft_dataset(train_data[:1000], 1000, tokenizer)
     print(f"SFT on {len(dataset)} examples (teaching format only)")
 
@@ -327,11 +298,12 @@ def run_sft(config, train_data):
             logging_steps=1,
             optim="adamw_8bit",
             output_dir=config["grpo_output"] + "_sft",
-            save_steps=200,
+            save_steps=50,
             max_seq_length=config["max_seq_length"],
             dataset_text_field="text",
             report_to="wandb" if use_wandb else "none",
             run_name=f"sft-{config['model_size']}",
+            bf16=True,
         ),
     )
 
@@ -339,21 +311,25 @@ def run_sft(config, train_data):
     trainer.train()
     if use_wandb:
         wandb.finish()
+
+    # Save merged model (LoRA merged into base weights)
     sft_dir = config["grpo_output"] + "_sft"
-    model.save_pretrained_merged(sft_dir, tokenizer, save_method="merged_16bit")
+    merged = model.merge_and_unload()
+    merged.save_pretrained(sft_dir)
+    tokenizer.save_pretrained(sft_dir)
     print(f"SFT merged model saved to {sft_dir}")
 
-    # Verify format compliance before moving on
-    print("\nVerifying format compliance on 50 samples...")
-    FastLanguageModel.for_inference(model)
+    # Verify format compliance
+    print("\nVerifying format compliance on 20 samples...")
+    merged.eval()
     correct = 0
-    total = 50
+    total = 20
     for entry in train_data[:total]:
         system_msg, user_msg = build_prompt(entry["move_sequence"])
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-        inputs = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(model.device)
+        inputs = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(merged.device)
         with torch.no_grad():
-            outputs = model.generate(input_ids=inputs, max_new_tokens=512, do_sample=False)
+            outputs = merged.generate(input_ids=inputs, max_new_tokens=128, do_sample=False)
         response = tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True)
         if is_clean_output(response):
             correct += 1
@@ -362,7 +338,9 @@ def run_sft(config, train_data):
 
     if pct >= 80:
         print(f"\n>>> Format compliance {pct:.0f}% >= 80%. Starting GRPO automatically...\n")
-        return True  # Signal to start GRPO
+        del merged
+        torch.cuda.empty_cache()
+        return True
     else:
         print(f"\n>>> Format compliance {pct:.0f}% < 80%. Consider more SFT steps.")
         return False
@@ -376,12 +354,7 @@ NUM_BUCKETS = 10
 
 
 class GaussianCurriculumSampler(Sampler):
-    """Samples from difficulty buckets using a Gaussian distribution.
-
-    Dataset is pre-sorted easy→hard, split into NUM_BUCKETS equal buckets.
-    A Gaussian centered on `center` (0=easy, 9=hard) controls sampling
-    probability per bucket. The center advances as the model improves.
-    """
+    """Samples from difficulty buckets using a Gaussian distribution."""
 
     def __init__(self, dataset_size, num_buckets=NUM_BUCKETS, sigma=1.5, seed=42):
         self.dataset_size = dataset_size
@@ -390,7 +363,6 @@ class GaussianCurriculumSampler(Sampler):
         self.center = 0.0
         self.rng = random.Random(seed)
 
-        # Precompute bucket index ranges
         bucket_size = dataset_size // num_buckets
         self.bucket_ranges = []
         for b in range(num_buckets):
@@ -410,7 +382,6 @@ class GaussianCurriculumSampler(Sampler):
         probs = self._bucket_probs()
         indices = []
         for _ in range(self.dataset_size):
-            # Pick bucket according to Gaussian probs
             r = self.rng.random()
             cumsum = 0.0
             bucket = 0
@@ -419,7 +390,6 @@ class GaussianCurriculumSampler(Sampler):
                 if r <= cumsum:
                     bucket = i
                     break
-            # Pick random index within that bucket
             start, end = self.bucket_ranges[bucket]
             indices.append(self.rng.randint(start, end - 1))
         return iter(indices)
@@ -429,11 +399,7 @@ class GaussianCurriculumSampler(Sampler):
 
 
 class CurriculumCallback(TrainerCallback):
-    """Advances the Gaussian center when the model approaches optimal play.
-
-    Tracks actual rewards vs max possible rewards for positions seen.
-    When ratio >= threshold over `check_interval` steps, advances to next level.
-    """
+    """Advances difficulty when the model approaches optimal play."""
 
     def __init__(self, sampler, reward_calc, threshold=0.7, check_interval=100):
         self.sampler = sampler
@@ -446,20 +412,17 @@ class CurriculumCallback(TrainerCallback):
         if logs is None:
             return
 
-        # Log curriculum state
-        if logs is not None:
-            logs["curriculum_level"] = self.sampler.center
-            if self.reward_calc.max_reward_log:
-                avg_max = sum(self.reward_calc.max_reward_log) / len(self.reward_calc.max_reward_log)
-                avg_got = sum(self.reward_calc.reward_log) / len(self.reward_calc.reward_log)
-                logs["curriculum_ratio"] = avg_got / avg_max if avg_max != 0 else 0.0
+        logs["curriculum_level"] = self.sampler.center
+        if self.reward_calc.max_reward_log:
+            avg_max = sum(self.reward_calc.max_reward_log) / len(self.reward_calc.max_reward_log)
+            avg_got = sum(self.reward_calc.reward_log) / len(self.reward_calc.reward_log)
+            logs["curriculum_ratio"] = avg_got / avg_max if avg_max != 0 else 0.0
 
         if state.global_step - self.last_check_step < self.check_interval:
             return
         if self.sampler.center >= self.sampler.num_buckets - 1:
             return
 
-        # Compute ratio from tracked rewards
         if not self.reward_calc.max_reward_log:
             return
         avg_max = sum(self.reward_calc.max_reward_log) / len(self.reward_calc.max_reward_log)
@@ -473,7 +436,6 @@ class CurriculumCallback(TrainerCallback):
             print(f"\n>>> CURRICULUM: ratio {ratio:.2f} >= {self.threshold}, advancing to level {self.sampler.center:.0f}/9")
             print(f"    Top buckets: {['L'+str(b) + f'({probs[b]:.0%})' for b in top_buckets]}")
 
-        # Reset logs for next interval
         self.reward_calc.max_reward_log.clear()
         self.reward_calc.reward_log.clear()
         self.last_check_step = state.global_step
@@ -509,7 +471,6 @@ def is_clean_output(text):
 class RewardCalculator:
     def __init__(self, data):
         self.score_lookup = build_lookup_table(data)
-        # Tracked by CurriculumCallback to compute reward/max ratio
         self.reward_log = []
         self.max_reward_log = []
 
@@ -530,7 +491,6 @@ class RewardCalculator:
             else:
                 scores = self.score_lookup.get(seq)
                 rewards.append(scores[col] * 10.0 if scores else 0.0)
-            # Track for curriculum: actual reward vs max possible
             self.reward_log.append(rewards[-1])
             if max_reward is not None:
                 self.max_reward_log.append(max_reward[i])
@@ -542,7 +502,6 @@ class RewardCalculator:
 # =============================================================================
 
 def run_grpo(config, train_data):
-    from unsloth import FastLanguageModel
     from trl import GRPOConfig, GRPOTrainer
     print(f"\n{'='*60}\nGRPO TRAINING -- {config['model_name']}\n{'='*60}")
 
@@ -552,36 +511,18 @@ def run_grpo(config, train_data):
         print(f"  Loading merged SFT model: {sft_dir}")
         load_model = sft_dir
     else:
-        print("  WARNING: No SFT checkpoint found. Run --stage sft first for best results.")
+        print("  WARNING: No SFT checkpoint found. Run --stage sft first.")
         load_model = config["model_name"]
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=load_model,
-        max_seq_length=config["max_seq_length"],
-        load_in_4bit=False,
-        fast_inference=True,
-        max_lora_rank=config["lora_r"],
-        gpu_memory_utilization=0.6,
-    )
-
-    # Apply fresh LoRA for GRPO training
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=config["lora_r"],
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha=config["lora_alpha"],
-        lora_dropout=0,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=3407,
-    )
+    model, tokenizer = load_model_and_tokenizer(load_model)
+    model = apply_lora(model, config)
 
     reward_calc = RewardCalculator(train_data)
     print(f"Training on {len(train_data)} positions, {len(reward_calc.score_lookup)} in lookup")
     dataset = prepare_grpo_dataset(train_data, config["grpo_max_rows"], tokenizer)
     run_name = f"grpo-{config['model_size']}"
 
-    # Gaussian curriculum: 10 difficulty levels, advances when reward/max >= threshold
+    # Gaussian curriculum
     sampler = GaussianCurriculumSampler(len(dataset))
     curriculum_cb = CurriculumCallback(
         sampler, reward_calc,
@@ -600,34 +541,33 @@ def run_grpo(config, train_data):
                 "model": config["model_name"],
                 "stage": "grpo",
                 "num_generations": config["grpo_num_generations"],
-                "temperature": config["grpo_temperature"],
-                "max_seq_length": config["max_seq_length"],
             },
             reinit=True,
         )
 
-    grpo_kwargs = dict(
+    grpo_config = GRPOConfig(
         output_dir=config["grpo_output"],
-        learning_rate=5e-6,
-        adam_beta1=0.9,
-        adam_beta2=0.99,
-        weight_decay=0.1,
-        warmup_ratio=0.1,
-        lr_scheduler_type="cosine",
-        optim="adamw_8bit",
-        logging_steps=1,
+        use_vllm=True,
+        vllm_mode="colocate",
+        vllm_gpu_memory_utilization=0.5,
+        temperature=1.0,
+        num_generations=config["grpo_num_generations"],
+        max_completion_length=512,
+        max_prompt_length=512,
         per_device_train_batch_size=config["grpo_batch_size"],
         gradient_accumulation_steps=config["grpo_grad_accum"],
-        num_generations=config["grpo_num_generations"],
-        max_prompt_length=512,
-        max_completion_length=512,
         max_steps=config["grpo_max_steps"],
         save_steps=300,
+        learning_rate=5e-5,
+        weight_decay=0.001,
+        warmup_ratio=0.1,
+        lr_scheduler_type="linear",
+        optim="adamw_8bit",
         max_grad_norm=0.1,
+        logging_steps=1,
         report_to="wandb" if use_wandb else "none",
         run_name=run_name,
-        loss_type=config.get("grpo_loss_type") or "dr_grpo",
-        mask_truncated_completions=False,
+        bf16=True,
     )
 
     trainer = GRPOTrainer(
@@ -637,15 +577,14 @@ def run_grpo(config, train_data):
             reward_calc.reward_format,
             reward_calc.reward_move_quality,
         ],
-        args=GRPOConfig(**grpo_kwargs),
+        args=grpo_config,
         train_dataset=dataset,
         callbacks=[curriculum_cb],
     )
-    trainer.sampler = sampler
 
-    print("\nStarting GRPO... Watch reward climb at https://wandb.ai -> connect4-llm")
-    print(f"  max_completion_length=512 (thinking enabled via SFT)")
-    print(f"  Curriculum: level 0→9 (easy→hard), Gaussian σ=1.5, advances at {config.get('curriculum_threshold', 0.7):.0%} ratio")
+    print("\nStarting GRPO with vLLM colocate mode...")
+    print(f"  max_completion_length=512")
+    print(f"  Curriculum: level 0→9 (easy→hard), advances at {config.get('curriculum_threshold', 0.7):.0%} ratio")
     trainer.train()
     if use_wandb:
         wandb.finish()
@@ -659,7 +598,6 @@ def run_grpo(config, train_data):
 # =============================================================================
 
 def run_eval(config, eval_data):
-    from unsloth import FastLanguageModel
     print(f"\n{'='*60}\nEVALUATION -- {config['model_size'].upper()}\n{'='*60}")
 
     checkpoint_dir = config["grpo_output"]
@@ -667,12 +605,9 @@ def run_eval(config, eval_data):
         print("ERROR: No model found")
         return
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=checkpoint_dir,
-        max_seq_length=config["max_seq_length"],
-        load_in_4bit=False,
-    )
-    FastLanguageModel.for_inference(model)
+    model, tokenizer = load_model_and_tokenizer(config["model_name"])
+    model = PeftModel.from_pretrained(model, checkpoint_dir)
+    model.eval()
     print(f"Evaluating on {len(eval_data)} held-out positions...")
 
     exact = 0
@@ -680,14 +615,13 @@ def run_eval(config, eval_data):
     score_sum = 0.0
     valid = 0
     invalid = 0
-    json_count = 0
     phase_stats = {p: {"correct": 0, "total": 0, "score_sum": 0.0} for p in [
         "opening (0-8 moves)", "midgame (9-20 moves)", "endgame (21+ moves)"
     ]}
 
     for i, entry in enumerate(eval_data):
         if i % 1000 == 0 and i > 0:
-            print(f"  ...{i}/10000 (acc: {100*exact/valid:.1f}%)" if valid else f"  ...{i}/10000")
+            print(f"  ...{i}/{len(eval_data)} (acc: {100*exact/valid:.1f}%)" if valid else f"  ...{i}/{len(eval_data)}")
 
         seq = entry["move_sequence"]
         scores = entry["scores"]
@@ -695,16 +629,11 @@ def run_eval(config, eval_data):
         phase = "opening (0-8 moves)" if len(seq) <= 8 else "midgame (9-20 moves)" if len(seq) <= 20 else "endgame (21+ moves)"
 
         system_msg, user_msg = build_prompt(seq)
-        msgs = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ]
-        inputs = tokenizer.apply_chat_template(
-            msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt",
-        ).to(model.device)
+        msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+        inputs = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(model.device)
 
         with torch.no_grad():
-            outputs = model.generate(input_ids=inputs, max_new_tokens=512, do_sample=False)
+            outputs = model.generate(input_ids=inputs, max_new_tokens=128, do_sample=False)
         response = tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True)
         col = extract_column_from_response(response)
 
@@ -713,8 +642,6 @@ def run_eval(config, eval_data):
             continue
 
         valid += 1
-        if classify_format(response) == "json":
-            json_count += 1
         score_sum += scores[col]
         if col == best_col:
             exact += 1
@@ -733,7 +660,6 @@ def run_eval(config, eval_data):
     if valid == 0:
         print("  No valid outputs to score.")
         return
-    print(f"  JSON format:       {json_count}/{valid} ({100*json_count/valid:.1f}%)")
     print(f"  Exact match:       {exact}/{valid} ({100*exact/valid:.1f}%)")
     print(f"  Top-2 match:       {top2}/{valid} ({100*top2/valid:.1f}%)")
     print(f"  Mean oracle score: {score_sum/valid:+.4f}")
@@ -745,7 +671,6 @@ def run_eval(config, eval_data):
         "model": config["model_name"],
         "model_size": config["model_size"],
         "valid_pct": round(100 * valid / total, 2),
-        "json_format_pct": round(100 * json_count / valid, 2),
         "exact_match_pct": round(100 * exact / valid, 2),
         "top2_match_pct": round(100 * top2 / valid, 2),
         "mean_oracle_score": round(score_sum / valid, 4),
@@ -760,48 +685,31 @@ def run_eval(config, eval_data):
 # =============================================================================
 
 def export_model(config):
-    from unsloth import FastLanguageModel
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=config["grpo_output"],
-        max_seq_length=config["max_seq_length"],
-        load_in_4bit=False,
-    )
-    model.save_pretrained_merged(config["final_model"], tokenizer, save_method="merged_16bit")
-    model.save_pretrained_gguf(config["final_model"] + "-gguf", tokenizer, quantization_method="q4_k_m")
-    print(f"Exported to {config['final_model']} and {config['final_model']}-gguf")
+    model, tokenizer = load_model_and_tokenizer(config["model_name"])
+    model = PeftModel.from_pretrained(model, config["grpo_output"])
+    merged = model.merge_and_unload()
+    merged.save_pretrained(config["final_model"])
+    tokenizer.save_pretrained(config["final_model"])
+    print(f"Exported merged model to {config['final_model']}")
 
 
 def push_to_hub(config):
     if not HF_AVAILABLE:
-        print("ERROR: huggingface_hub not installed. Run: pip install huggingface_hub")
+        print("ERROR: huggingface_hub not installed.")
         return
-    from huggingface_hub import HfApi, create_repo
     hf_repo = config.get("hf_repo")
     if not hf_repo:
-        print("ERROR: --hf-repo is required for push stage (e.g. yourname/connect4-agent-8b)")
+        print("ERROR: --hf-repo is required for push stage")
         return
-    if hf_repo.upper().endswith("-GGUF"):
-        print("WARNING: --hf-repo should be the base repo name. Stripping '-GGUF' suffix.")
-        hf_repo = hf_repo[:-5]
     api = HfApi()
-    size = config["model_size"]
     merged_dir = config["final_model"]
-    gguf_dir = config["final_model"] + "-gguf"
     if os.path.exists(merged_dir):
-        print(f"\nPushing merged model to https://huggingface.co/{hf_repo}")
+        print(f"\nPushing to https://huggingface.co/{hf_repo}")
         create_repo(hf_repo, exist_ok=True)
-        api.upload_folder(folder_path=merged_dir, repo_id=hf_repo, commit_message=f"Upload Connect4 agent ({size}) — merged 16-bit")
+        api.upload_folder(folder_path=merged_dir, repo_id=hf_repo, commit_message=f"Upload Connect4 agent ({config['model_size']})")
         print(f"  -> https://huggingface.co/{hf_repo}")
     else:
         print(f"WARNING: {merged_dir}/ not found — run --stage export first")
-    if os.path.exists(gguf_dir):
-        gguf_repo = hf_repo + "-GGUF"
-        print(f"\nPushing GGUF to https://huggingface.co/{gguf_repo}")
-        create_repo(gguf_repo, exist_ok=True)
-        api.upload_folder(folder_path=gguf_dir, repo_id=gguf_repo, commit_message=f"Upload Connect4 agent ({size}) — GGUF q4_k_m")
-        print(f"  -> https://huggingface.co/{gguf_repo}")
-    else:
-        print(f"WARNING: {gguf_dir}/ not found — run --stage export first")
 
 
 # =============================================================================
@@ -813,15 +721,14 @@ def main():
     parser.add_argument("--model", choices=["3b", "8b"], required=True)
     parser.add_argument("--stage", choices=["sft", "grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
-    parser.add_argument("--hf-repo", default=None, help="HuggingFace repo id for push (e.g. yourname/connect4-agent-8b)")
-    parser.add_argument("--max-steps", type=int, default=None, help="Override max training steps (default: 2000)")
-    parser.add_argument("--curriculum-threshold", type=float, default=0.7, help="Advance difficulty when reward/max >= this (default: 0.7)")
-    parser.add_argument("--loss-type", default=None, help="GRPO loss type (e.g. dr_grpo)")
+    parser.add_argument("--hf-repo", default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--curriculum-threshold", type=float, default=0.7)
+    parser.add_argument("--loss-type", default=None)
     parser.add_argument("--no-wandb", action="store_true")
     args = parser.parse_args()
 
     use_wandb = WANDB_AVAILABLE and not args.no_wandb
-
     config = get_config(args.model)
     config["csv_path"] = args.csv
     config["hf_repo"] = args.hf_repo
