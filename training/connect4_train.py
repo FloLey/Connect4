@@ -334,10 +334,13 @@ def run_sft(config, train_data):
     for entry in train_data[:total]:
         system_msg, user_msg = build_prompt(entry["move_sequence"])
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-        inputs = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(merged.device)
+        input_ids = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt")
+        if isinstance(input_ids, dict):
+            input_ids = input_ids["input_ids"]
+        input_ids = input_ids.to(merged.device)
         with torch.no_grad():
-            outputs = merged.generate(input_ids=inputs, max_new_tokens=128, do_sample=False)
-        response = tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True)
+            outputs = merged.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
+        response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
         if is_clean_output(response):
             correct += 1
     pct = 100 * correct / total
@@ -637,11 +640,14 @@ def run_eval(config, eval_data):
 
         system_msg, user_msg = build_prompt(seq)
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-        inputs = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(model.device)
+        input_ids = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt")
+        if isinstance(input_ids, dict):
+            input_ids = input_ids["input_ids"]
+        input_ids = input_ids.to(model.device)
 
         with torch.no_grad():
-            outputs = model.generate(input_ids=inputs, max_new_tokens=128, do_sample=False)
-        response = tokenizer.decode(outputs[0][inputs.shape[-1]:], skip_special_tokens=True)
+            outputs = model.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
+        response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
         col = extract_column_from_response(response)
 
         if col is None:
