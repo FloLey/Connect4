@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore", message=".*attention mask is not set.*")
 import torch
 from datasets import Dataset
 from torch.utils.data import Sampler
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
+from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoTokenizer, TrainerCallback
 from peft import LoraConfig, get_peft_model, PeftModel
 
 try:
@@ -114,8 +114,8 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "3b": {"model_name": "mistralai/Ministral-3-3B-Instruct-2512", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 1, "grpo_grad_accum": 2},
-    "8b": {"model_name": "mistralai/Ministral-3-8B-Instruct-2512", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 1, "grpo_grad_accum": 4},
+    "7b": {"model_name": "mistralai/Mistral-7B-Instruct-v0.3", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 1, "grpo_grad_accum": 2},
+    "8b": {"model_name": "mistralai/Ministral-8B-Instruct-2410", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 1, "grpo_grad_accum": 4},
 }
 
 
@@ -238,15 +238,22 @@ def prepare_sft_dataset(data, max_rows, tokenizer):
 # =============================================================================
 
 def load_model_and_tokenizer(model_name):
-    """Load model and tokenizer with standard HF stack."""
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
+    """Load model and tokenizer. Auto-detects model type."""
+    from transformers import AutoConfig, AutoModel
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Use AutoModel to handle both CausalLM and ConditionalGeneration
+    config = AutoConfig.from_pretrained(model_name)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=torch.bfloat16,
+        )
+    except (ValueError, KeyError):
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_name, dtype=torch.bfloat16,
+        )
     return model, tokenizer
 
 
@@ -718,7 +725,7 @@ def push_to_hub(config):
 
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GRPO Training Pipeline")
-    parser.add_argument("--model", choices=["3b", "8b"], required=True)
+    parser.add_argument("--model", choices=["7b", "8b"], required=True)
     parser.add_argument("--stage", choices=["sft", "grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None)
