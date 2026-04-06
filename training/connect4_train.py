@@ -294,7 +294,7 @@ def run_sft(config, train_data):
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=dataset,
         args=SFTConfig(
             per_device_train_batch_size=8,
