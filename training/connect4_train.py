@@ -566,7 +566,6 @@ def run_grpo(config, train_data):
         temperature=1.0,
         num_generations=config["grpo_num_generations"],
         max_completion_length=512,
-        max_prompt_length=512,
         per_device_train_batch_size=config["grpo_batch_size"],
         gradient_accumulation_steps=config["grpo_grad_accum"],
         max_steps=config["grpo_max_steps"],
