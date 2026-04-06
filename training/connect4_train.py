@@ -324,6 +324,16 @@ def run_sft(config, train_data):
     merged = model.merge_and_unload()
     merged.save_pretrained(sft_dir)
     tokenizer.save_pretrained(sft_dir)
+
+    # Copy processor files from original model (needed by vLLM for multimodal arch)
+    from huggingface_hub import hf_hub_download
+    import shutil
+    for fname in ["preprocessor_config.json", "processor_config.json"]:
+        try:
+            path = hf_hub_download(config["model_name"], fname)
+            shutil.copy(path, sft_dir)
+        except Exception:
+            pass
     print(f"SFT merged model saved to {sft_dir}")
 
     # Verify format compliance
