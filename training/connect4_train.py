@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore", message=".*attention mask is not set.*")
 import torch
 from datasets import Dataset
 from torch.utils.data import Sampler
-from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoTokenizer, TrainerCallback
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer, TrainerCallback
 from peft import LoraConfig, get_peft_model, PeftModel
 
 try:
