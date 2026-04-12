@@ -35,8 +35,10 @@ On **each pod**, run:
 git clone https://github.com/FloLey/Connect4.git
 cd Connect4/training
 
-# Install the two extras not in the base image
-pip install -U wandb huggingface_hub
+# Install the two extras not in the base image.
+# Pin huggingface_hub < 1.0 — transformers 4.57 in the unsloth image is
+# incompatible with the 1.x release.
+pip install wandb hf_transfer 'huggingface_hub<1.0'
 
 # Login to wandb (paste API key when prompted)
 wandb login
