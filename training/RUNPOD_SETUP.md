@@ -41,7 +41,7 @@ cd Connect4/training
 # - unsloth-zoo caps transformers at <=5.5.0, so pin to 5.5.0 exactly
 #   (latest `pip install -U transformers` overshoots to 5.5.3+).
 # Upgrading transformers pulls in huggingface_hub >= 1.0, which is fine.
-pip install -U wandb hf_transfer
+pip install -U wandb hf_transfer trl
 pip install 'transformers==5.5.0'
 
 # hf_transfer is only active when this env var is set.
