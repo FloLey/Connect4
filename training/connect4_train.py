@@ -215,8 +215,16 @@ def prepare_grpo_dataset(data, max_rows, tokenizer):
             {"role": "user", "content": user_msg},
         ]
         best_score = max(entry["scores"])
+        # DeepSeek-R1 / gpt-oss trick: prefix `<think>` to the prompt so the
+        # model's first generated token is guaranteed to be INSIDE a think
+        # block. Without this, base Gemma 4's strong prior P(digit|prompt)
+        # wins over SFT's weaker P(<think>|prompt) and the model skips
+        # thinking entirely. The model then only has to continue the think
+        # block and close it — which SFT teaches well under teacher forcing.
+        prompt_str = tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
+        prompt_str = prompt_str + "<think>"
         formatted.append({
-            "prompt": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=True),
+            "prompt": prompt_str,
             "move_sequence": entry["move_sequence"],
             "max_reward": best_score * 10.0 + 1.0,
         })
@@ -531,8 +539,13 @@ class CurriculumCallback(TrainerCallback):
 # =============================================================================
 
 def strip_thinking(text):
-    """Remove <think>...</think> blocks from output."""
-    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    """Remove <think>...</think> blocks from output. Also strips the
+    closing-only pattern `...</think>` at the start of the text, which
+    is what we get when the GRPO prompt has a prepended `<think>` so the
+    completion starts mid-think-block."""
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    text = re.sub(r'^.*?</think>', '', text, flags=re.DOTALL)
+    return text.strip()
 
 
 def extract_column_from_response(text):
@@ -572,15 +585,24 @@ class RewardCalculator:
         return rewards
 
     def reward_thinking(self, completions, **kwargs):
-        """Reward a non-trivial <think>...</think> block preceding the digit.
-        Magnitude is ~1/10 of reward_move_quality so it nudges the model
-        toward thinking without drowning out move-quality gradient."""
+        """Reward a non-trivial think-block before the digit. Accepts both:
+           - `<think>...</think>` — full block, emitted spontaneously
+           - `...</think>`        — closing-only, emitted because the prompt
+                                    already prepended `<think>` for GRPO.
+        Magnitude is ~1/10 of reward_move_quality so it nudges toward
+        thinking without drowning out move-quality gradient."""
         rewards = []
         for c in completions:
-            m = re.search(r'<think>(.*?)</think>', c, re.DOTALL)
-            if m and len(m.group(1).strip()) >= 10:
+            m_full = re.search(r'<think>(.*?)</think>', c, re.DOTALL)
+            m_close = re.match(r'^(.*?)</think>', c, re.DOTALL)
+            content = None
+            if m_full:
+                content = m_full.group(1).strip()
+            elif m_close:
+                content = m_close.group(1).strip()
+            if content is not None and len(content) >= 10:
                 rewards.append(1.0)      # substantive think block
-            elif m:
+            elif content is not None:
                 rewards.append(-0.5)     # tag present but near-empty
             else:
                 rewards.append(-2.0)     # no think block at all
