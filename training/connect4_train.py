@@ -390,21 +390,12 @@ def run_sft(config, train_data):
     pct = 100 * correct / total
     print(f"  Format compliance: {correct}/{total} ({pct:.0f}%)")
 
-    # Aggressive cleanup before returning — GSPO will re-load base Gemma 4 in
-    # 8-bit on the 24 GB 4090 and needs ALL of SFT's GPU state (8-bit base,
-    # dequantized merged bf16 model, trainer + optimizer state, dataset) to
-    # be freed first. bnb-8bit refuses to load if accelerate has to offload
-    # any layer to CPU, and that's exactly what happens if this memory
-    # lingers.
-    for _name in ("merged", "model", "trainer", "dataset"):
-        if _name in locals():
-            del _name
+    # Drop the dequantized merged model + trainer; keep `model` (the PEFT-
+    # wrapped SFT-trained model) and `tokenizer` — main() passes them straight
+    # into run_grpo so the SFT learning stays in memory (no save/reload
+    # round-trip, which through 8-bit bnb silently loses the LoRA delta).
     try:
         del merged
-    except NameError:
-        pass
-    try:
-        del model
     except NameError:
         pass
     try:
@@ -422,11 +413,13 @@ def run_sft(config, train_data):
         torch.cuda.synchronize()
 
     if pct >= 80:
-        print(f"\n>>> Format compliance {pct:.0f}% >= 80%. Starting GRPO automatically...\n")
-        return True
+        print(f"\n>>> Format compliance {pct:.0f}% >= 80%. Starting GSPO automatically...\n")
+        # Put the model back in training mode for GRPO (compliance check ran .eval()).
+        model.train()
+        return model, tokenizer
     else:
         print(f"\n>>> Format compliance {pct:.0f}% < 80%. Consider more SFT steps.")
-        return False
+        return None
 
 
 # =============================================================================
@@ -584,38 +577,41 @@ class RewardCalculator:
 # GRPO TRAINING
 # =============================================================================
 
-def run_grpo(config, train_data):
+def run_grpo(config, train_data, model=None, tokenizer=None):
     from trl import GRPOConfig, GRPOTrainer
     print(f"\n{'='*60}\nGSPO TRAINING -- {config['model_name']}\n{'='*60}")
 
-    # SFT is saved as a LoRA adapter (to dodge a Gemma 4 + Unsloth config
-    # serialization bug). Load base + adapter via Unsloth's FastLanguageModel
-    # rather than stock PeftModel.from_pretrained — stock peft doesn't
-    # understand Gemma 4's custom Gemma4ClippableLinear wrapper and crashes
-    # during adapter re-injection with "Target module ... is not supported".
-    #
-    # Do NOT merge_and_unload + apply fresh LoRA: merging LoRA into 8-bit
-    # base quantizes the delta back to 8-bit with heavy rounding loss, so
-    # SFT's learning doesn't survive into GSPO. Instead keep the SFT
-    # adapter attached and continue training IT as the GSPO adapter.
-    sft_dir = config["grpo_output"] + "_sft"
-    sft_adapter_config = os.path.join(sft_dir, "adapter_config.json")
-    if os.path.exists(sft_adapter_config):
-        print(f"  Loading base + SFT LoRA adapter from {sft_dir} — continuing adapter training for GSPO")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=sft_dir,
-            max_seq_length=config["max_seq_length"],
-            load_in_4bit=config.get("load_in_4bit", False),
-            load_in_8bit=config.get("load_in_8bit", False),
-            full_finetuning=False,
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        # The adapter is loaded attached and trainable; skip apply_lora.
+    # Three ways this gets called:
+    # 1. From main() right after run_sft — `model` is the already-PEFT-wrapped,
+    #    SFT-trained model still in memory. USE IT DIRECTLY. We learned the hard
+    #    way that save → reload via Unsloth's FastLanguageModel OR stock
+    #    PeftModel.from_pretrained either crashes (Gemma4ClippableLinear not
+    #    supported by stock peft) or silently loses the SFT weights (8-bit
+    #    merge-and-unload quantizes the delta back into int8).
+    # 2. --stage grpo on a fresh pod where an SFT adapter dir exists on disk —
+    #    best-effort: load base + adapter via Unsloth. Known lossy through
+    #    the 8-bit round-trip but keeps the resume-after-pod-death promise.
+    # 3. --stage grpo with no SFT on disk — cold start.
+    if model is None or tokenizer is None:
+        sft_dir = config["grpo_output"] + "_sft"
+        sft_adapter_config = os.path.join(sft_dir, "adapter_config.json")
+        if os.path.exists(sft_adapter_config):
+            print(f"  Loading base + SFT LoRA adapter from {sft_dir} (resume path)")
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=sft_dir,
+                max_seq_length=config["max_seq_length"],
+                load_in_4bit=config.get("load_in_4bit", False),
+                load_in_8bit=config.get("load_in_8bit", False),
+                full_finetuning=False,
+            )
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+        else:
+            print("  No SFT adapter found — starting GSPO from base Gemma 4.")
+            model, tokenizer = load_model_and_tokenizer(config)
+            model = apply_lora(model, config)
     else:
-        print("  No SFT adapter found — starting GSPO from base Gemma 4.")
-        model, tokenizer = load_model_and_tokenizer(config)
-        model = apply_lora(model, config)
+        print("  Using in-memory SFT-trained model handed over by run_sft (no save/reload)")
 
     reward_calc = RewardCalculator(train_data)
     print(f"Training on {len(train_data)} positions, {len(reward_calc.score_lookup)} in lookup")
@@ -889,8 +885,10 @@ def main():
     print(f"Data split: {len(train_data)} train, {len(eval_data)} eval (seed=42, no overlap)")
 
     if args.stage == "sft":
-        if run_sft(config, train_data):
-            run_grpo(config, train_data)
+        sft_result = run_sft(config, train_data)
+        if sft_result is not None:
+            sft_model, sft_tokenizer = sft_result
+            run_grpo(config, train_data, model=sft_model, tokenizer=sft_tokenizer)
     elif args.stage == "grpo":
         run_grpo(config, train_data)
     elif args.stage == "eval":
