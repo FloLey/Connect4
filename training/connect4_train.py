@@ -16,6 +16,7 @@ from unsloth import FastLanguageModel  # noqa: F401
 
 import argparse
 import csv
+import gc
 import json
 import math
 import os
@@ -389,10 +390,39 @@ def run_sft(config, train_data):
     pct = 100 * correct / total
     print(f"  Format compliance: {correct}/{total} ({pct:.0f}%)")
 
+    # Aggressive cleanup before returning — GSPO will re-load base Gemma 4 in
+    # 8-bit on the 24 GB 4090 and needs ALL of SFT's GPU state (8-bit base,
+    # dequantized merged bf16 model, trainer + optimizer state, dataset) to
+    # be freed first. bnb-8bit refuses to load if accelerate has to offload
+    # any layer to CPU, and that's exactly what happens if this memory
+    # lingers.
+    for _name in ("merged", "model", "trainer", "dataset"):
+        if _name in locals():
+            del _name
+    try:
+        del merged
+    except NameError:
+        pass
+    try:
+        del model
+    except NameError:
+        pass
+    try:
+        del trainer
+    except NameError:
+        pass
+    try:
+        del dataset
+    except NameError:
+        pass
+    gc.collect()
+    gc.collect()
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
     if pct >= 80:
         print(f"\n>>> Format compliance {pct:.0f}% >= 80%. Starting GRPO automatically...\n")
-        del merged
-        torch.cuda.empty_cache()
         return True
     else:
         print(f"\n>>> Format compliance {pct:.0f}% < 80%. Consider more SFT steps.")
