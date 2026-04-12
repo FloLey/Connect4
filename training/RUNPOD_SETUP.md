@@ -35,11 +35,14 @@ On **each pod**, run:
 git clone https://github.com/FloLey/Connect4.git
 cd Connect4/training
 
-# Install extras + upgrade transformers (the unsloth:latest image ships
-# transformers 4.57, which predates Gemma 4's `gemma4` architecture id —
-# loading the model fails with `KeyError: 'gemma4'` on the stock image).
-# Upgrading transformers also accepts huggingface_hub >= 1.0, so no pin.
-pip install -U wandb hf_transfer transformers
+# Install extras + upgrade transformers.
+# - unsloth:latest ships transformers 4.57, which predates Gemma 4's
+#   `gemma4` architecture id (KeyError: 'gemma4' at load time).
+# - unsloth-zoo caps transformers at <=5.5.0, so pin to 5.5.0 exactly
+#   (latest `pip install -U transformers` overshoots to 5.5.3+).
+# Upgrading transformers pulls in huggingface_hub >= 1.0, which is fine.
+pip install -U wandb hf_transfer
+pip install 'transformers==5.5.0'
 
 # Login to wandb (paste API key when prompted)
 wandb login
