@@ -364,12 +364,15 @@ def run_sft(config, train_data):
     tokenizer.save_pretrained(sft_dir)
     print(f"SFT LoRA adapter saved to {sft_dir}")
 
-    # Merge into a new in-memory model for format compliance verification.
-    merged = model.merge_and_unload()
-
-    # Verify format compliance
+    # Verify format compliance using the PEFT-wrapped model directly — DO NOT
+    # merge_and_unload. merge_and_unload() mutates `model` to no longer be a
+    # PeftModel (adapter layers removed, weights merged into base), so we'd
+    # hand GSPO a non-PEFT merged model whose trainable params are either the
+    # whole 8B base (OOM) or nothing at all. Plain model.eval() leaves the
+    # adapter active during forward/generate; model.train() before returning
+    # puts dropout back for GSPO.
     print("\nVerifying format compliance on 20 samples...")
-    merged.eval()
+    model.eval()
     correct = 0
     total = 20
     for entry in train_data[:total]:
@@ -381,23 +384,17 @@ def run_sft(config, train_data):
         # a positional arg gets routed to `images` and `text` ends up None — which
         # then crashes inside Gemma4Processor doing text[0].
         rendered = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        input_ids = tokenizer(text=rendered, return_tensors="pt").input_ids.to(merged.device)
+        input_ids = tokenizer(text=rendered, return_tensors="pt").input_ids.to(model.device)
         with torch.no_grad():
-            outputs = merged.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
+            outputs = model.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
         response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
         if is_clean_output(response):
             correct += 1
     pct = 100 * correct / total
     print(f"  Format compliance: {correct}/{total} ({pct:.0f}%)")
 
-    # Drop the dequantized merged model + trainer; keep `model` (the PEFT-
-    # wrapped SFT-trained model) and `tokenizer` — main() passes them straight
-    # into run_grpo so the SFT learning stays in memory (no save/reload
-    # round-trip, which through 8-bit bnb silently loses the LoRA delta).
-    try:
-        del merged
-    except NameError:
-        pass
+    # Drop trainer + dataset; keep `model` (PEFT-wrapped, SFT-trained) and
+    # `tokenizer` — main() passes them straight into run_grpo.
     try:
         del trainer
     except NameError:
@@ -414,7 +411,6 @@ def run_sft(config, train_data):
 
     if pct >= 80:
         print(f"\n>>> Format compliance {pct:.0f}% >= 80%. Starting GSPO automatically...\n")
-        # Put the model back in training mode for GRPO (compliance check ran .eval()).
         model.train()
         return model, tokenizer
     else:
