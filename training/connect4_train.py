@@ -549,13 +549,13 @@ def is_clean_output(text):
 # =============================================================================
 
 class RewardCalculator:
-    def __init__(self, data, debug_every=5):
+    def __init__(self, data, debug_every=1):
         self.score_lookup = build_lookup_table(data)
         self.reward_log = []
         self.max_reward_log = []
         # Debug: every `debug_every` reward-function calls (= training steps),
-        # print the prompt + best completion of the batch so we can eyeball
-        # what the model is actually producing.
+        # print the prompt + ALL N completions in the group with their rewards
+        # so we can eyeball exactly what the model is generating.
         self._debug_every = debug_every
         self._reward_quality_calls = 0
 
@@ -580,21 +580,32 @@ class RewardCalculator:
             if max_reward is not None:
                 self.max_reward_log.append(max_reward[i])
 
-        # Debug print: best completion in this batch, with its board + oracle row.
+        # Debug print: board + ALL completions with their rewards. All
+        # completions in this call belong to the same group (we set
+        # per_device_train_batch_size == num_generations) so they share
+        # the same move_sequence / board / oracle scores.
         self._reward_quality_calls += 1
         if self._debug_every and self._reward_quality_calls % self._debug_every == 0 and rewards:
-            best_idx = max(range(len(rewards)), key=lambda k: rewards[k])
-            best_seq = move_sequence[best_idx]
-            game = reconstruct_board(best_seq)
-            oracle_scores = self.score_lookup.get(best_seq, [0.0]*7)
+            # Use the first entry's move_sequence — in the usual config all
+            # entries share it, but fall back gracefully if not.
+            seq = move_sequence[0]
+            game = reconstruct_board(seq)
+            oracle_scores = self.score_lookup.get(seq, [0.0]*7)
             best_col_oracle = max(range(7), key=lambda c: oracle_scores[c])
-            best_completion = completions[best_idx]
-            # Truncate long completions to keep log readable
-            disp_comp = best_completion if len(best_completion) <= 200 else best_completion[:200] + "..."
-            print(f"\n[sample step {self._reward_quality_calls}] move_seq={best_seq!r} (len={len(best_seq)})")
-            print(f"  board:\n{game.get_visual_board()}")
+            print(f"\n[step {self._reward_quality_calls}] move_seq={seq!r} (len={len(seq)})")
+            print(f"  board:")
+            for line in game.get_visual_board().splitlines():
+                print(f"    {line}")
             print(f"  oracle scores: {[round(s, 2) for s in oracle_scores]}  best_col={best_col_oracle}")
-            print(f"  best completion (reward={rewards[best_idx]:+.2f}): {disp_comp!r}")
+            print(f"  completions ({len(completions)} generations):")
+            for k, (c, r) in enumerate(zip(completions, rewards)):
+                # Truncate very long completions to keep log readable
+                disp = c if len(c) <= 150 else c[:150] + "..."
+                # Escape newlines inside completions for single-line display
+                disp = disp.replace("\n", "\\n")
+                col_parsed = extract_column_from_response(c)
+                col_str = str(col_parsed) if col_parsed is not None else "?"
+                print(f"    [{k}] col={col_str} reward={r:+6.2f}  {disp!r}")
         return rewards
 
 
