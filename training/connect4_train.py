@@ -1,9 +1,13 @@
 """
-Connect Four LLM Training Pipeline — GRPO with trl + vLLM (Ministral 3)
+Connect Four LLM Training Pipeline — GSPO with trl + Unsloth (Gemma 4)
 Usage:
-  python connect4_train.py --model {3b,8b} --stage {sft,grpo,eval,export,push} --csv connect4_data.csv
-  python connect4_train.py --model 8b --stage push --hf-repo yourname/connect4-agent-8b
+  python connect4_train.py --model {e2b-bf16,e2b-8bit,e4b-bf16,e4b-8bit} --stage {sft,grpo,eval,export,push} --csv connect4_data.csv
+  python connect4_train.py --model e4b-8bit --stage grpo --hf-repo yourname/connect4-agent-e4b-8bit
+  python connect4_train.py --model e4b-8bit --stage push --hf-repo yourname/connect4-agent-e4b-8bit
 """
+
+# Unsloth must be imported before transformers / trl so its patches apply.
+from unsloth import FastLanguageModel  # noqa: F401
 
 import argparse
 import csv
@@ -22,8 +26,8 @@ warnings.filterwarnings("ignore", message=".*attention mask is not set.*")
 import torch
 from datasets import Dataset
 from torch.utils.data import Sampler
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer, TrainerCallback
-from peft import LoraConfig, get_peft_model, PeftModel
+from transformers import TrainerCallback
+from peft import PeftModel
 
 try:
     import wandb
@@ -114,8 +118,10 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "3b": {"model_name": "mistralai/Ministral-3-3B-Instruct-2512-BF16", "lora_r": 32, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
-    "8b": {"model_name": "mistralai/Ministral-3-8B-Instruct-2512-BF16", "lora_r": 32, "grpo_num_generations": 3, "grpo_batch_size": 3, "grpo_grad_accum": 4},
+    "e2b-bf16": {"model_name": "unsloth/gemma-4-E2B-it", "load_in_4bit": False, "load_in_8bit": False, "lora_r": 16, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "e2b-8bit": {"model_name": "unsloth/gemma-4-E2B-it", "load_in_4bit": False, "load_in_8bit": True,  "lora_r": 16, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "e4b-bf16": {"model_name": "unsloth/gemma-4-E4B-it", "load_in_4bit": False, "load_in_8bit": False, "lora_r": 16, "grpo_num_generations": 3, "grpo_batch_size": 3, "grpo_grad_accum": 4},
+    "e4b-8bit": {"model_name": "unsloth/gemma-4-E4B-it", "load_in_4bit": False, "load_in_8bit": True,  "lora_r": 16, "grpo_num_generations": 3, "grpo_batch_size": 3, "grpo_grad_accum": 4},
 }
 
 
@@ -125,6 +131,8 @@ def get_config(model_size):
         "model_name": mc["model_name"],
         "model_size": model_size,
         "max_seq_length": 2048,
+        "load_in_4bit": mc["load_in_4bit"],
+        "load_in_8bit": mc["load_in_8bit"],
         "lora_r": mc["lora_r"],
         "lora_alpha": mc["lora_r"] * 2,
         "grpo_max_steps": 2000,
@@ -237,46 +245,39 @@ def prepare_sft_dataset(data, max_rows, tokenizer):
 # SFT — teach the model the output format before GRPO
 # =============================================================================
 
-def load_model_and_tokenizer(model_name):
-    """Load model and tokenizer. Auto-detects model type."""
-    from transformers import AutoConfig, AutoModel
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+def load_model_and_tokenizer(config, model_path=None):
+    """Load model and tokenizer via Unsloth's FastLanguageModel (text-only)."""
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_path or config["model_name"],
+        max_seq_length=config["max_seq_length"],
+        load_in_4bit=config.get("load_in_4bit", False),
+        load_in_8bit=config.get("load_in_8bit", False),
+        full_finetuning=False,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    # Use AutoModel to handle both CausalLM and ConditionalGeneration
-    config = AutoConfig.from_pretrained(model_name)
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, dtype=torch.bfloat16,
-        )
-    except (ValueError, KeyError):
-        from transformers import AutoModelForImageTextToText
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_name, dtype=torch.bfloat16,
-        )
     return model, tokenizer
 
 
 def apply_lora(model, config):
-    """Apply LoRA adapters to the model."""
-    lora_config = LoraConfig(
+    """Apply LoRA adapters via Unsloth's helper."""
+    return FastLanguageModel.get_peft_model(
+        model,
         r=config["lora_r"],
         lora_alpha=config["lora_alpha"],
         lora_dropout=0,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         bias="none",
-        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        use_gradient_checkpointing="unsloth",
+        random_state=3407,
     )
-    model = get_peft_model(model, lora_config)
-    model.gradient_checkpointing_enable()
-    return model
 
 
 def run_sft(config, train_data):
     from trl import SFTTrainer, SFTConfig
     print(f"\n{'='*60}\nSFT FORMAT TRAINING -- {config['model_name']}\n{'='*60}")
 
-    model, tokenizer = load_model_and_tokenizer(config["model_name"])
+    model, tokenizer = load_model_and_tokenizer(config)
     model = apply_lora(model, config)
 
     dataset = prepare_sft_dataset(train_data[:1000], 1000, tokenizer)
@@ -324,16 +325,6 @@ def run_sft(config, train_data):
     merged = model.merge_and_unload()
     merged.save_pretrained(sft_dir)
     tokenizer.save_pretrained(sft_dir)
-
-    # Copy processor files from original model (needed by vLLM for multimodal arch)
-    from huggingface_hub import hf_hub_download
-    import shutil
-    for fname in ["preprocessor_config.json", "processor_config.json"]:
-        try:
-            path = hf_hub_download(config["model_name"], fname)
-            shutil.copy(path, sft_dir)
-        except Exception:
-            pass
     print(f"SFT merged model saved to {sft_dir}")
 
     # Verify format compliance
@@ -526,18 +517,19 @@ class RewardCalculator:
 
 def run_grpo(config, train_data):
     from trl import GRPOConfig, GRPOTrainer
-    print(f"\n{'='*60}\nGRPO TRAINING -- {config['model_name']}\n{'='*60}")
+    print(f"\n{'='*60}\nGSPO TRAINING -- {config['model_name']}\n{'='*60}")
 
-    # Load from SFT merged model if available, otherwise base model
+    # Load from SFT merged model if available, otherwise base model.
+    # Gemma 4 handles the single-digit + <think> format natively, so SFT is optional.
     sft_dir = config["grpo_output"] + "_sft"
     if os.path.exists(sft_dir):
         print(f"  Loading merged SFT model: {sft_dir}")
-        load_model = sft_dir
+        load_path = sft_dir
     else:
-        print("  WARNING: No SFT checkpoint found. Run --stage sft first.")
-        load_model = config["model_name"]
+        print("  No SFT checkpoint found — starting GSPO from base Gemma 4.")
+        load_path = None
 
-    model, tokenizer = load_model_and_tokenizer(load_model)
+    model, tokenizer = load_model_and_tokenizer(config, model_path=load_path)
     model = apply_lora(model, config)
 
     reward_calc = RewardCalculator(train_data)
@@ -568,11 +560,12 @@ def run_grpo(config, train_data):
             reinit=True,
         )
 
-    grpo_config = GRPOConfig(
+    # GSPO paper setting: sequence-level importance sampling, vanilla GRPO loss,
+    # beta=0, tight clipping range. See https://unsloth.ai/docs/get-started/reinforcement-learning-rl-guide/gspo-reinforcement-learning
+    loss_type = config.get("grpo_loss_type") or "grpo"
+    hf_repo = config.get("hf_repo")
+    grpo_kwargs = dict(
         output_dir=config["grpo_output"],
-        use_vllm=True,
-        vllm_mode="colocate",
-        vllm_gpu_memory_utilization=0.5,
         temperature=1.0,
         num_generations=config["grpo_num_generations"],
         max_completion_length=512,
@@ -590,7 +583,22 @@ def run_grpo(config, train_data):
         report_to="wandb" if use_wandb else "none",
         run_name=run_name,
         bf16=True,
+        # --- GSPO ---
+        importance_sampling_level="sequence",
+        loss_type=loss_type,
+        beta=0.0,
+        epsilon=3e-4,
+        epsilon_high=4e-4,
     )
+    if hf_repo:
+        # Crash-safety: checkpoint the LoRA adapter to HF every save (every 300 steps).
+        grpo_kwargs.update(
+            push_to_hub=True,
+            hub_model_id=hf_repo,
+            hub_strategy="every_save",
+            hub_private_repo=True,
+        )
+    grpo_config = GRPOConfig(**grpo_kwargs)
 
     trainer = GRPOTrainer(
         model=model,
@@ -604,15 +612,17 @@ def run_grpo(config, train_data):
         callbacks=[curriculum_cb],
     )
 
-    print("\nStarting GRPO with vLLM colocate mode...")
-    print(f"  max_completion_length=512")
+    print("\nStarting GSPO (Unsloth inference, sequence-level IS)...")
+    print(f"  loss_type={loss_type}  max_completion_length=512")
     print(f"  Curriculum: level 0→9 (easy→hard), advances at {config.get('curriculum_threshold', 0.7):.0%} ratio")
+    if hf_repo:
+        print(f"  HF auto-push: every save to https://huggingface.co/{hf_repo} (private)")
     trainer.train()
     if use_wandb:
         wandb.finish()
     model.save_pretrained(config["grpo_output"])
     tokenizer.save_pretrained(config["grpo_output"])
-    print(f"GRPO saved to {config['grpo_output']}")
+    print(f"GSPO adapter saved to {config['grpo_output']}")
 
 
 # =============================================================================
@@ -627,7 +637,7 @@ def run_eval(config, eval_data):
         print("ERROR: No model found")
         return
 
-    model, tokenizer = load_model_and_tokenizer(config["model_name"])
+    model, tokenizer = load_model_and_tokenizer(config)
     model = PeftModel.from_pretrained(model, checkpoint_dir)
     model.eval()
     print(f"Evaluating on {len(eval_data)} held-out positions...")
@@ -710,12 +720,25 @@ def run_eval(config, eval_data):
 # =============================================================================
 
 def export_model(config):
-    model, tokenizer = load_model_and_tokenizer(config["model_name"])
+    model, tokenizer = load_model_and_tokenizer(config)
     model = PeftModel.from_pretrained(model, config["grpo_output"])
     merged = model.merge_and_unload()
     merged.save_pretrained(config["final_model"])
     tokenizer.save_pretrained(config["final_model"])
     print(f"Exported merged model to {config['final_model']}")
+
+    # GGUF (q4_k_m) for llama.cpp / Ollama. save_pretrained_gguf is an Unsloth
+    # method patched onto the model at load time.
+    gguf_dir = config["final_model"] + "-gguf"
+    try:
+        merged.save_pretrained_gguf(
+            gguf_dir,
+            tokenizer,
+            quantization_method="q4_k_m",
+        )
+        print(f"Exported GGUF to {gguf_dir}")
+    except Exception as e:
+        print(f"WARNING: GGUF export failed ({e}). Merged HF weights still saved to {config['final_model']}.")
 
 
 def push_to_hub(config):
@@ -728,13 +751,22 @@ def push_to_hub(config):
         return
     api = HfApi()
     merged_dir = config["final_model"]
+    gguf_dir = config["final_model"] + "-gguf"
+
     if os.path.exists(merged_dir):
-        print(f"\nPushing to https://huggingface.co/{hf_repo}")
+        print(f"\nPushing merged weights to https://huggingface.co/{hf_repo}")
         create_repo(hf_repo, exist_ok=True)
         api.upload_folder(folder_path=merged_dir, repo_id=hf_repo, commit_message=f"Upload Connect4 agent ({config['model_size']})")
         print(f"  -> https://huggingface.co/{hf_repo}")
     else:
         print(f"WARNING: {merged_dir}/ not found — run --stage export first")
+
+    if os.path.exists(gguf_dir):
+        gguf_repo = f"{hf_repo}-GGUF"
+        print(f"\nPushing GGUF to https://huggingface.co/{gguf_repo}")
+        create_repo(gguf_repo, exist_ok=True)
+        api.upload_folder(folder_path=gguf_dir, repo_id=gguf_repo, commit_message=f"Upload Connect4 agent GGUF ({config['model_size']})")
+        print(f"  -> https://huggingface.co/{gguf_repo}")
 
 
 # =============================================================================
@@ -742,8 +774,8 @@ def push_to_hub(config):
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Connect Four GRPO Training Pipeline")
-    parser.add_argument("--model", choices=["3b", "8b"], required=True)
+    parser = argparse.ArgumentParser(description="Connect Four GSPO Training Pipeline (Gemma 4 + Unsloth)")
+    parser.add_argument("--model", choices=["e2b-bf16", "e2b-8bit", "e4b-bf16", "e4b-8bit"], required=True)
     parser.add_argument("--stage", choices=["sft", "grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None)
