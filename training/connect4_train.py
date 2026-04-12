@@ -124,10 +124,10 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "e2b-bf16": {"model_name": "unsloth/gemma-4-E2B-it", "load_in_4bit": False, "load_in_8bit": False, "lora_r": 16, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
-    "e2b-8bit": {"model_name": "unsloth/gemma-4-E2B-it", "load_in_4bit": False, "load_in_8bit": True,  "lora_r": 16, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
-    "e4b-bf16": {"model_name": "unsloth/gemma-4-E4B-it", "load_in_4bit": False, "load_in_8bit": False, "lora_r": 16, "grpo_num_generations": 3, "grpo_batch_size": 3, "grpo_grad_accum": 4},
-    "e4b-8bit": {"model_name": "unsloth/gemma-4-E4B-it", "load_in_4bit": False, "load_in_8bit": True,  "lora_r": 16, "grpo_num_generations": 3, "grpo_batch_size": 3, "grpo_grad_accum": 4},
+    "e2b-bf16": {"model_name": "unsloth/gemma-4-E2B-it", "load_in_4bit": False, "load_in_8bit": False, "lora_r": 16, "grpo_num_generations": 8, "grpo_batch_size": 8, "grpo_grad_accum": 1},
+    "e2b-8bit": {"model_name": "unsloth/gemma-4-E2B-it", "load_in_4bit": False, "load_in_8bit": True,  "lora_r": 16, "grpo_num_generations": 8, "grpo_batch_size": 8, "grpo_grad_accum": 1},
+    "e4b-bf16": {"model_name": "unsloth/gemma-4-E4B-it", "load_in_4bit": False, "load_in_8bit": False, "lora_r": 16, "grpo_num_generations": 6, "grpo_batch_size": 6, "grpo_grad_accum": 2},
+    "e4b-8bit": {"model_name": "unsloth/gemma-4-E4B-it", "load_in_4bit": False, "load_in_8bit": True,  "lora_r": 16, "grpo_num_generations": 8, "grpo_batch_size": 8, "grpo_grad_accum": 1},
 }
 
 
@@ -541,10 +541,15 @@ def is_clean_output(text):
 # =============================================================================
 
 class RewardCalculator:
-    def __init__(self, data):
+    def __init__(self, data, debug_every=5):
         self.score_lookup = build_lookup_table(data)
         self.reward_log = []
         self.max_reward_log = []
+        # Debug: every `debug_every` reward-function calls (= training steps),
+        # print the prompt + best completion of the batch so we can eyeball
+        # what the model is actually producing.
+        self._debug_every = debug_every
+        self._reward_quality_calls = 0
 
     def reward_format(self, completions, **kwargs):
         """Reward for outputting just a single digit 0-6."""
@@ -566,6 +571,22 @@ class RewardCalculator:
             self.reward_log.append(rewards[-1])
             if max_reward is not None:
                 self.max_reward_log.append(max_reward[i])
+
+        # Debug print: best completion in this batch, with its board + oracle row.
+        self._reward_quality_calls += 1
+        if self._debug_every and self._reward_quality_calls % self._debug_every == 0 and rewards:
+            best_idx = max(range(len(rewards)), key=lambda k: rewards[k])
+            best_seq = move_sequence[best_idx]
+            game = reconstruct_board(best_seq)
+            oracle_scores = self.score_lookup.get(best_seq, [0.0]*7)
+            best_col_oracle = max(range(7), key=lambda c: oracle_scores[c])
+            best_completion = completions[best_idx]
+            # Truncate long completions to keep log readable
+            disp_comp = best_completion if len(best_completion) <= 200 else best_completion[:200] + "..."
+            print(f"\n[sample step {self._reward_quality_calls}] move_seq={best_seq!r} (len={len(best_seq)})")
+            print(f"  board:\n{game.get_visual_board()}")
+            print(f"  oracle scores: {[round(s, 2) for s in oracle_scores]}  best_col={best_col_oracle}")
+            print(f"  best completion (reward={rewards[best_idx]:+.2f}): {disp_comp!r}")
         return rewards
 
 
@@ -612,6 +633,12 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     reward_calc = RewardCalculator(train_data)
     print(f"Training on {len(train_data)} positions, {len(reward_calc.score_lookup)} in lookup")
     dataset = prepare_grpo_dataset(train_data, config["grpo_max_rows"], tokenizer)
+
+    # One-shot sanity: report prompt token length on a few examples so we can
+    # eyeball whether max_completion_length / max_seq_length are well-sized.
+    sample_prompts = [dataset[i]["prompt"] for i in range(min(5, len(dataset)))]
+    sample_lens = [len(tokenizer(text=p, return_tensors="pt").input_ids[0]) for p in sample_prompts]
+    print(f"  prompt token lengths (first 5): {sample_lens}  max_completion_length=512  temperature=1.0")
     run_name = f"grpo-{config['model_size']}"
 
     # Gaussian curriculum
