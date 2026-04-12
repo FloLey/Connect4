@@ -59,29 +59,29 @@ hf auth login
 
 ## Step 2: Launch Training
 
-One command per pod. Passing `--hf-repo` makes the trainer push the LoRA adapter to Hugging Face every 300 steps (private repo by default) — if the pod dies you won't lose more than one checkpoint window of progress.
+One command per pod. The default stage is `sft` which runs a 50-step format warmup and then auto-chains into GSPO once format compliance hits ≥ 80%. Passing `--hf-repo` makes the trainer push the LoRA adapter to Hugging Face every 300 steps (private repo by default) — if the pod dies you won't lose more than one checkpoint window of progress.
 
 **Pod 1 (E2B BF16):**
 ```bash
-python connect4_train.py --model e2b-bf16 --stage grpo --csv connect4_data.csv \
+python connect4_train.py --model e2b-bf16 --csv connect4_data.csv \
     --hf-repo Betha/connect4-agent-e2b-bf16
 ```
 
 **Pod 2 (E2B 8-bit):**
 ```bash
-python connect4_train.py --model e2b-8bit --stage grpo --csv connect4_data.csv \
+python connect4_train.py --model e2b-8bit --csv connect4_data.csv \
     --hf-repo Betha/connect4-agent-e2b-8bit
 ```
 
 **Pod 3 (E4B BF16):**
 ```bash
-python connect4_train.py --model e4b-bf16 --stage grpo --csv connect4_data.csv \
+python connect4_train.py --model e4b-bf16 --csv connect4_data.csv \
     --hf-repo Betha/connect4-agent-e4b-bf16
 ```
 
 **Pod 4 (E4B 8-bit):**
 ```bash
-python connect4_train.py --model e4b-8bit --stage grpo --csv connect4_data.csv \
+python connect4_train.py --model e4b-8bit --csv connect4_data.csv \
     --hf-repo Betha/connect4-agent-e4b-8bit
 ```
 

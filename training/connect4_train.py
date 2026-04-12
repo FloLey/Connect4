@@ -1,8 +1,13 @@
 """
 Connect Four LLM Training Pipeline — GSPO with trl + Unsloth (Gemma 4)
+
+Default stage is `sft`, which runs a 50-step format warmup and then auto-
+chains into GSPO when format compliance is ≥ 80%.
+
 Usage:
-  python connect4_train.py --model {e2b-bf16,e2b-8bit,e4b-bf16,e4b-8bit} --stage {sft,grpo,eval,export,push} --csv connect4_data.csv
-  python connect4_train.py --model e4b-8bit --stage grpo --hf-repo yourname/connect4-agent-e4b-8bit
+  python connect4_train.py --model {e2b-bf16,e2b-8bit,e4b-bf16,e4b-8bit} [--stage {sft,grpo,eval,export,push}] --csv connect4_data.csv
+  python connect4_train.py --model e4b-8bit --hf-repo yourname/connect4-agent-e4b-8bit  # SFT → GSPO
+  python connect4_train.py --model e4b-8bit --stage grpo --hf-repo yourname/connect4-agent-e4b-8bit  # resume GSPO only
   python connect4_train.py --model e4b-8bit --stage push --hf-repo yourname/connect4-agent-e4b-8bit
 """
 
@@ -776,7 +781,7 @@ def push_to_hub(config):
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GSPO Training Pipeline (Gemma 4 + Unsloth)")
     parser.add_argument("--model", choices=["e2b-bf16", "e2b-8bit", "e4b-bf16", "e4b-8bit"], required=True)
-    parser.add_argument("--stage", choices=["sft", "grpo", "eval", "export", "push"], default="grpo")
+    parser.add_argument("--stage", choices=["sft", "grpo", "eval", "export", "push"], default="sft")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None)
     parser.add_argument("--max-steps", type=int, default=None)
