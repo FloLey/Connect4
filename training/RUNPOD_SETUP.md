@@ -44,6 +44,9 @@ cd Connect4/training
 pip install -U wandb hf_transfer
 pip install 'transformers==5.5.0'
 
+# hf_transfer is only active when this env var is set.
+export HF_HUB_ENABLE_HF_TRANSFER=1
+
 # Login to wandb (paste API key when prompted)
 wandb login
 
