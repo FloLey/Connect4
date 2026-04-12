@@ -593,13 +593,15 @@ def run_grpo(config, train_data):
     # rather than stock PeftModel.from_pretrained — stock peft doesn't
     # understand Gemma 4's custom Gemma4ClippableLinear wrapper and crashes
     # during adapter re-injection with "Target module ... is not supported".
-    # Unsloth's loader reads adapter_config.json, pulls the matching base,
-    # applies the adapter, and returns an Unsloth-patched PEFT model whose
-    # merge_and_unload() handles Gemma4ClippableLinear correctly.
+    #
+    # Do NOT merge_and_unload + apply fresh LoRA: merging LoRA into 8-bit
+    # base quantizes the delta back to 8-bit with heavy rounding loss, so
+    # SFT's learning doesn't survive into GSPO. Instead keep the SFT
+    # adapter attached and continue training IT as the GSPO adapter.
     sft_dir = config["grpo_output"] + "_sft"
     sft_adapter_config = os.path.join(sft_dir, "adapter_config.json")
     if os.path.exists(sft_adapter_config):
-        print(f"  Loading base + SFT LoRA adapter from {sft_dir} via Unsloth (merge in-memory)")
+        print(f"  Loading base + SFT LoRA adapter from {sft_dir} — continuing adapter training for GSPO")
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=sft_dir,
             max_seq_length=config["max_seq_length"],
@@ -609,11 +611,11 @@ def run_grpo(config, train_data):
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        model = model.merge_and_unload()
+        # The adapter is loaded attached and trainable; skip apply_lora.
     else:
         print("  No SFT adapter found — starting GSPO from base Gemma 4.")
         model, tokenizer = load_model_and_tokenizer(config)
-    model = apply_lora(model, config)
+        model = apply_lora(model, config)
 
     reward_calc = RewardCalculator(train_data)
     print(f"Training on {len(train_data)} positions, {len(reward_calc.score_lookup)} in lookup")
