@@ -43,8 +43,9 @@ pip install wandb hf_transfer 'huggingface_hub<1.0'
 # Login to wandb (paste API key when prompted)
 wandb login
 
-# Login to HF (paste write token when prompted) — required for auto-push
-huggingface-cli login
+# Login to HF (paste write token when prompted) — required for auto-push.
+# The new CLI is `hf`; `huggingface-cli` is deprecated.
+hf auth login
 ```
 
 ---
