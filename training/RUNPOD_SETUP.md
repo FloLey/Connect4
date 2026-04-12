@@ -19,7 +19,7 @@ No SFT needed — Gemma 4 has native thinking (`<think>`) and learns the single-
 ## Step 0: Weights & Biases + Hugging Face Setup
 
 1. Sign up at [wandb.ai](https://wandb.ai) and grab your key at [wandb.ai/authorize](https://wandb.ai/authorize).
-2. Sign up at [huggingface.co](https://huggingface.co) and create a **write** token at [Settings → Access Tokens](https://huggingface.co/settings/tokens). Pick your repo name pattern up front, e.g. `<you>/connect4-agent-e4b-8bit` — one repo per variant.
+2. Sign up at [huggingface.co](https://huggingface.co) and create a **write** token at [Settings → Access Tokens](https://huggingface.co/settings/tokens). Pick your repo name pattern up front, e.g. `Betha/connect4-agent-e4b-8bit` — one repo per variant.
 3. Keep both keys handy — you'll paste them on each pod.
 
 ---
@@ -54,25 +54,25 @@ One command per pod. Passing `--hf-repo` makes the trainer push the LoRA adapter
 **Pod 1 (E2B BF16):**
 ```bash
 python connect4_train.py --model e2b-bf16 --stage grpo --csv connect4_data.csv \
-    --hf-repo <you>/connect4-agent-e2b-bf16
+    --hf-repo Betha/connect4-agent-e2b-bf16
 ```
 
 **Pod 2 (E2B 8-bit):**
 ```bash
 python connect4_train.py --model e2b-8bit --stage grpo --csv connect4_data.csv \
-    --hf-repo <you>/connect4-agent-e2b-8bit
+    --hf-repo Betha/connect4-agent-e2b-8bit
 ```
 
 **Pod 3 (E4B BF16):**
 ```bash
 python connect4_train.py --model e4b-bf16 --stage grpo --csv connect4_data.csv \
-    --hf-repo <you>/connect4-agent-e4b-bf16
+    --hf-repo Betha/connect4-agent-e4b-bf16
 ```
 
 **Pod 4 (E4B 8-bit):**
 ```bash
 python connect4_train.py --model e4b-8bit --stage grpo --csv connect4_data.csv \
-    --hf-repo <you>/connect4-agent-e4b-8bit
+    --hf-repo Betha/connect4-agent-e4b-8bit
 ```
 
 All four stream metrics to the same wandb project and their LoRA adapters land in four separate HF repos.
@@ -143,12 +143,12 @@ This creates:
 After exporting, push the merged weights + GGUF to HuggingFace so you can reuse the model anywhere (the LoRA adapter has been auto-pushed during training already; this publishes the *merged* final model):
 
 ```bash
-python connect4_train.py --model e4b-bf16 --stage push --hf-repo <you>/connect4-agent-e4b-bf16
+python connect4_train.py --model e4b-bf16 --stage push --hf-repo Betha/connect4-agent-e4b-bf16
 ```
 
 This uploads two repos:
-- `<you>/connect4-agent-e4b-bf16` — the merged 16-bit model (use with `transformers` / vLLM)
-- `<you>/connect4-agent-e4b-bf16-GGUF` — the quantized GGUF (use with llama.cpp / Ollama)
+- `Betha/connect4-agent-e4b-bf16` — the merged 16-bit model (use with `transformers` / vLLM)
+- `Betha/connect4-agent-e4b-bf16-GGUF` — the quantized GGUF (use with llama.cpp / Ollama)
 
 ---
 
@@ -158,12 +158,12 @@ If a pod disconnects mid-training, spin up a fresh RTX 4090 with `unsloth/unslot
 
 ```bash
 # Example: resume e4b-8bit
-huggingface-cli download <you>/connect4-agent-e4b-8bit \
+huggingface-cli download Betha/connect4-agent-e4b-8bit \
     --local-dir outputs_grpo_e4b-8bit
 
 # Re-run the exact same training command — TRL auto-resumes from the checkpoint
 python connect4_train.py --model e4b-8bit --stage grpo --csv connect4_data.csv \
-    --hf-repo <you>/connect4-agent-e4b-8bit
+    --hf-repo Betha/connect4-agent-e4b-8bit
 ```
 
 `outputs_grpo_{variant}/` must contain a `checkpoint-*/` subdirectory for TRL to resume; the HF repo preserves it via `hub_strategy="every_save"`.
@@ -190,13 +190,13 @@ All 4 variants should fit on a 24 GB RTX 4090. If you get CUDA OOM:
 If the model can't produce a clean single-digit answer after ~200 steps, run a short SFT warmup (~1K examples, 50 steps) before GSPO:
 ```bash
 python connect4_train.py --model e4b-8bit --stage sft --csv connect4_data.csv \
-    --hf-repo <you>/connect4-agent-e4b-8bit
+    --hf-repo Betha/connect4-agent-e4b-8bit
 ```
 `--stage sft` runs SFT, verifies ≥80% format compliance, then kicks off GSPO automatically.
 
 ### Pod disconnects mid-training
 
-- Checkpoints are saved every 300 steps in `outputs_grpo_{variant}/` **and** pushed to `<you>/connect4-agent-{variant}` on Hugging Face (when `--hf-repo` is set).
+- Checkpoints are saved every 300 steps in `outputs_grpo_{variant}/` **and** pushed to `Betha/connect4-agent-{variant}` on Hugging Face (when `--hf-repo` is set).
 - See **Step 7** below for the exact resume recipe on a fresh pod.
 - For extra safety, you can also attach a RunPod network volume so the local `outputs_grpo_{variant}/` persists across pod restarts — but with `--hf-repo` the HF repo is already a durable backup.
 
