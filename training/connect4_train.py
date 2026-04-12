@@ -175,13 +175,21 @@ def build_lookup_table(data):
 
 
 def difficulty_score(entry):
-    """Higher std = easier. Returns negative std so reverse sort puts easy first."""
+    """Std across the 7 column scores. High std = easy (one move is clearly
+    better or worse than the others — strong learning signal). Low std =
+    hard (all moves are roughly equal, usually losing endgames or forced
+    draws where the choice barely matters and there's little to learn)."""
     scores = entry["scores"]
     mean = sum(scores) / len(scores)
-    return -(sum((s - mean) ** 2 for s in scores) / len(scores)) ** 0.5
+    return (sum((s - mean) ** 2 for s in scores) / len(scores)) ** 0.5
 
 
 def sort_by_difficulty(data):
+    # Easy (high std) first, hard (low std) last. GaussianCurriculumSampler
+    # starts at bucket 0 and advances outward, so bucket 0 must hold the
+    # most-learnable examples. Before this change the sort key was -std
+    # with reverse=True, which accidentally put zero-std endgames at index
+    # 0 — i.e. the curriculum was sampling the hardest positions first.
     return sorted(data, key=difficulty_score, reverse=True)
 
 
