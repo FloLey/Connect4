@@ -325,12 +325,17 @@ def run_sft(config, train_data):
     if use_wandb:
         wandb.finish()
 
-    # Save merged model (LoRA merged into base weights)
+    # Save merged model. Use Unsloth's save_pretrained_merged rather than
+    # vanilla save_pretrained — Gemma 4's config ends up with a non-JSON-
+    # serializable function object after Unsloth's LoRA patches, which
+    # crashes transformers' config.to_json_file in plain save_pretrained.
+    # Must happen BEFORE merge_and_unload (which consumes the PEFT wrapper).
     sft_dir = config["grpo_output"] + "_sft"
-    merged = model.merge_and_unload()
-    merged.save_pretrained(sft_dir)
-    tokenizer.save_pretrained(sft_dir)
+    model.save_pretrained_merged(sft_dir, tokenizer, save_method="merged_16bit")
     print(f"SFT merged model saved to {sft_dir}")
+
+    # Merge into a new in-memory model for format compliance verification.
+    merged = model.merge_and_unload()
 
     # Verify format compliance
     print("\nVerifying format compliance on 20 samples...")
