@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 solver/book.bin
 solver/training_data/systematic_d10.csv
+connect4_thoughts.jsonl
