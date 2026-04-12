@@ -278,6 +278,33 @@ def apply_lora(model, config):
     )
 
 
+def _sanitize_config_for_save(cfg):
+    """Strip non-JSON-serializable callables from a transformers PretrainedConfig.
+
+    Gemma 4 + Unsloth patching leaves function/method objects on the config,
+    which crashes config.to_json_string() at save time. We walk the config
+    and any nested sub-configs (text_config, vision_config, audio_config)
+    and delete attributes whose value is callable but isn't a type/class.
+    """
+    import types
+    if cfg is None:
+        return
+    bad_types = (types.FunctionType, types.MethodType, types.BuiltinFunctionType, types.BuiltinMethodType, types.LambdaType)
+    for attr in list(vars(cfg).keys()):
+        try:
+            val = getattr(cfg, attr)
+        except Exception:
+            continue
+        if isinstance(val, bad_types):
+            try:
+                delattr(cfg, attr)
+            except Exception:
+                pass
+    for sub in ("text_config", "vision_config", "audio_config"):
+        if hasattr(cfg, sub):
+            _sanitize_config_for_save(getattr(cfg, sub))
+
+
 def run_sft(config, train_data):
     from trl import SFTTrainer, SFTConfig
     print(f"\n{'='*60}\nSFT FORMAT TRAINING -- {config['model_name']}\n{'='*60}")
@@ -325,14 +352,16 @@ def run_sft(config, train_data):
     if use_wandb:
         wandb.finish()
 
-    # Save merged model. Use Unsloth's save_pretrained_merged rather than
-    # vanilla save_pretrained — Gemma 4's config ends up with a non-JSON-
-    # serializable function object after Unsloth's LoRA patches, which
-    # crashes transformers' config.to_json_file in plain save_pretrained.
-    # Must happen BEFORE merge_and_unload (which consumes the PEFT wrapper).
+    # Save LoRA adapter only (not the merged base). Merged save hits a
+    # Gemma 4 + Unsloth bug where model.config carries a function object
+    # that can't be JSON-serialized. PEFT's adapter save only writes
+    # adapter_config.json + adapter_model.safetensors and never touches
+    # the base-model config, so it's safe.
     sft_dir = config["grpo_output"] + "_sft"
-    model.save_pretrained_merged(sft_dir, tokenizer, save_method="merged_16bit")
-    print(f"SFT merged model saved to {sft_dir}")
+    _sanitize_config_for_save(model.config)  # defensive; noop if already clean
+    model.save_pretrained(sft_dir)
+    tokenizer.save_pretrained(sft_dir)
+    print(f"SFT LoRA adapter saved to {sft_dir}")
 
     # Merge into a new in-memory model for format compliance verification.
     merged = model.merge_and_unload()
@@ -529,17 +558,18 @@ def run_grpo(config, train_data):
     from trl import GRPOConfig, GRPOTrainer
     print(f"\n{'='*60}\nGSPO TRAINING -- {config['model_name']}\n{'='*60}")
 
-    # Load from SFT merged model if available, otherwise base model.
-    # Gemma 4 handles the single-digit + <think> format natively, so SFT is optional.
+    # SFT is saved as a LoRA adapter (to dodge a Gemma 4 + Unsloth config
+    # serialization bug). Load base Gemma, attach the SFT adapter, merge
+    # it in memory, then attach a fresh LoRA for GSPO on top.
     sft_dir = config["grpo_output"] + "_sft"
-    if os.path.exists(sft_dir):
-        print(f"  Loading merged SFT model: {sft_dir}")
-        load_path = sft_dir
+    sft_adapter_config = os.path.join(sft_dir, "adapter_config.json")
+    model, tokenizer = load_model_and_tokenizer(config)
+    if os.path.exists(sft_adapter_config):
+        print(f"  Loading SFT LoRA adapter from {sft_dir} and merging into base in-memory")
+        model = PeftModel.from_pretrained(model, sft_dir)
+        model = model.merge_and_unload()
     else:
-        print("  No SFT checkpoint found — starting GSPO from base Gemma 4.")
-        load_path = None
-
-    model, tokenizer = load_model_and_tokenizer(config, model_path=load_path)
+        print("  No SFT adapter found — starting GSPO from base Gemma 4.")
     model = apply_lora(model, config)
 
     reward_calc = RewardCalculator(train_data)
@@ -733,6 +763,9 @@ def export_model(config):
     model, tokenizer = load_model_and_tokenizer(config)
     model = PeftModel.from_pretrained(model, config["grpo_output"])
     merged = model.merge_and_unload()
+    # Strip any non-serializable callables Unsloth left on the config before
+    # transformers tries to json.dumps(config) during save_pretrained.
+    _sanitize_config_for_save(merged.config)
     merged.save_pretrained(config["final_model"])
     tokenizer.save_pretrained(config["final_model"])
     print(f"Exported merged model to {config['final_model']}")
