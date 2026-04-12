@@ -374,11 +374,13 @@ def run_sft(config, train_data):
     for entry in train_data[:total]:
         system_msg, user_msg = build_prompt(entry["move_sequence"])
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-        # Two-step render+tokenize: Gemma 4's processor interprets tokenize=True
-        # as the multimodal path, which assumes content is a list of blocks.
-        # Rendering to string first with tokenize=False stays on the text path.
-        text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        input_ids = tokenizer(text, return_tensors="pt").input_ids.to(merged.device)
+        # Two-step render + tokenize to dodge Gemma 4's multimodal Processor path.
+        # `text=` must be an explicit kwarg: Unsloth's patched processor __call__
+        # has signature (self, images=None, text=None, videos=None, **kwargs), so
+        # a positional arg gets routed to `images` and `text` ends up None — which
+        # then crashes inside Gemma4Processor doing text[0].
+        rendered = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        input_ids = tokenizer(text=rendered, return_tensors="pt").input_ids.to(merged.device)
         with torch.no_grad():
             outputs = merged.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
         response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
@@ -700,9 +702,10 @@ def run_eval(config, eval_data):
 
         system_msg, user_msg = build_prompt(seq)
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-        # Two-step render+tokenize to avoid Gemma 4 processor's multimodal path.
-        text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        input_ids = tokenizer(text, return_tensors="pt").input_ids.to(model.device)
+        # See run_sft: must pass `text=` as explicit kwarg through Unsloth's
+        # patched Gemma 4 Processor call.
+        rendered = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        input_ids = tokenizer(text=rendered, return_tensors="pt").input_ids.to(model.device)
 
         with torch.no_grad():
             outputs = model.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
