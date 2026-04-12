@@ -250,12 +250,46 @@ FILLER_THOUGHTS = [
 ]
 
 
+def _load_thoughts_jsonl(path="connect4_thoughts.jsonl"):
+    """Load teacher-model generated thoughts keyed by move_sequence.
+    Returns an empty dict if the file doesn't exist — SFT falls back to
+    the generic FILLER_THOUGHTS in that case."""
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            seq = obj.get("move_sequence")
+            thought = obj.get("thought")
+            if seq and thought:
+                out[seq] = thought.strip()
+    return out
+
+
 def prepare_sft_dataset(data, max_rows, tokenizer):
     rng = random.Random(42)
+    thoughts = _load_thoughts_jsonl()
+    if thoughts:
+        print(f"SFT: loaded {len(thoughts)} teacher thoughts from connect4_thoughts.jsonl")
+    else:
+        print("SFT: no connect4_thoughts.jsonl found — using generic FILLER_THOUGHTS fallback")
     formatted = []
+    missing = 0
     for entry in data[:max_rows]:
         system_msg, user_msg = build_prompt(entry["move_sequence"])
-        thought = rng.choice(FILLER_THOUGHTS)
+        # Prefer teacher-generated reasoning for this exact board; fall back
+        # to a random filler line if the position isn't in the JSONL.
+        thought = thoughts.get(entry["move_sequence"])
+        if thought is None:
+            missing += 1
+            thought = rng.choice(FILLER_THOUGHTS)
         best_col = entry["best_col"]
         conv = [
             {"role": "system", "content": system_msg},
@@ -265,6 +299,8 @@ def prepare_sft_dataset(data, max_rows, tokenizer):
         formatted.append({
             "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False),
         })
+    if thoughts and missing:
+        print(f"SFT: {missing}/{len(formatted)} positions had no teacher trace — used filler fallback")
     return Dataset.from_list(formatted)
 
 
