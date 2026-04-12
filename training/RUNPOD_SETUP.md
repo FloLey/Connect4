@@ -35,10 +35,11 @@ On **each pod**, run:
 git clone https://github.com/FloLey/Connect4.git
 cd Connect4/training
 
-# Install the two extras not in the base image.
-# Pin huggingface_hub < 1.0 — transformers 4.57 in the unsloth image is
-# incompatible with the 1.x release.
-pip install wandb hf_transfer 'huggingface_hub<1.0'
+# Install extras + upgrade transformers (the unsloth:latest image ships
+# transformers 4.57, which predates Gemma 4's `gemma4` architecture id —
+# loading the model fails with `KeyError: 'gemma4'` on the stock image).
+# Upgrading transformers also accepts huggingface_hub >= 1.0, so no pin.
+pip install -U wandb hf_transfer transformers
 
 # Login to wandb (paste API key when prompted)
 wandb login
