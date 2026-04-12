@@ -224,16 +224,21 @@ def prepare_grpo_dataset(data, max_rows, tokenizer):
 
 
 FILLER_THOUGHTS = [
-    "Thinking about this move.", "Let me consider the options.",
-    "Hmm, interesting position.", "I should pick carefully.",
-    "Looking at the board.", "What's the best play here?",
-    "Considering my options.", "Let me analyze this.",
-    "I need to decide.", "Evaluating the columns.",
-    "Time to make a move.", "Let me see.",
-    "Okay, let me think.", "Which column is best?",
-    "Tricky position.", "I think I see it.",
-    "Let me figure this out.", "Alright, here goes.",
-    "Not obvious, but let me try.", "What should I play?",
+    "Let me look at each column and figure out which move leaves me in the strongest position.",
+    "I should check if the opponent has any immediate three-in-a-row threats I need to block first.",
+    "Counting pieces and looking at potential four-in-a-row lines for each available column.",
+    "I'll evaluate which columns build toward my own threats while preventing counterplay.",
+    "Looking for a column that creates a double threat the opponent cannot stop.",
+    "Scanning rows, columns, and diagonals for the player I need to play as right now.",
+    "I need to balance offense and defense — pick a column that works for both.",
+    "Checking which columns lead to a forced win or a forced block in the next few moves.",
+    "Let me trace each candidate column to see what the opponent's best reply would be.",
+    "The key here is tempo — I should pick the column that keeps my initiative.",
+    "Which move controls the center and keeps my future options open?",
+    "I'll avoid columns that let the opponent land a piece directly below a winning slot.",
+    "Thinking about long-term structure: which column sets up the strongest follow-up?",
+    "I need to make sure I'm not walking into a trap where any reply loses.",
+    "Let me reason about the threats carefully before committing to a column.",
 ]
 
 
@@ -321,7 +326,7 @@ def run_sft(config, train_data):
     model, tokenizer = load_model_and_tokenizer(config)
     model = apply_lora(model, config)
 
-    dataset = prepare_sft_dataset(train_data[:1000], 1000, tokenizer)
+    dataset = prepare_sft_dataset(train_data[:5000], 5000, tokenizer)
     print(f"SFT on {len(dataset)} examples (teaching format only)")
 
     use_wandb = config.get("use_wandb", False)
@@ -342,7 +347,7 @@ def run_sft(config, train_data):
             per_device_train_batch_size=8,
             gradient_accumulation_steps=2,
             warmup_steps=20,
-            max_steps=50,
+            max_steps=200,
             learning_rate=2e-5,
             logging_steps=1,
             optim="adamw_8bit",
@@ -566,6 +571,21 @@ class RewardCalculator:
             rewards.append(1.0 if is_clean_output(c) else -10.0)
         return rewards
 
+    def reward_thinking(self, completions, **kwargs):
+        """Reward a non-trivial <think>...</think> block preceding the digit.
+        Magnitude is ~1/10 of reward_move_quality so it nudges the model
+        toward thinking without drowning out move-quality gradient."""
+        rewards = []
+        for c in completions:
+            m = re.search(r'<think>(.*?)</think>', c, re.DOTALL)
+            if m and len(m.group(1).strip()) >= 10:
+                rewards.append(1.0)      # substantive think block
+            elif m:
+                rewards.append(-0.5)     # tag present but near-empty
+            else:
+                rewards.append(-2.0)     # no think block at all
+        return rewards
+
     def reward_move_quality(self, completions, move_sequence, max_reward=None, **kwargs):
         """Core reward: oracle tanh score for the chosen column, scaled to [-10, +10]."""
         rewards = []
@@ -729,6 +749,7 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
         reward_funcs=[
             reward_calc.reward_format,
             reward_calc.reward_move_quality,
+            reward_calc.reward_thinking,
         ],
         args=grpo_config,
         train_dataset=dataset,
