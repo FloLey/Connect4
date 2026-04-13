@@ -585,7 +585,7 @@ def run_sft(config, train_data):
     # whole 8B base (OOM) or nothing at all. Plain model.eval() leaves the
     # adapter active during forward/generate; model.train() before returning
     # puts dropout back for GSPO.
-    print("\nVerifying format compliance on 20 samples (STRICT — must have <|channel>...<channel|> + digit)...")
+    print("\nVerifying format compliance on 20 samples (STRICT — must end in a digit 0-6 with reasoning before it)...")
     model.eval()
     correct = 0
     total = 20
@@ -593,12 +593,9 @@ def run_sft(config, train_data):
     for entry in train_data[:total]:
         system_msg, user_msg = build_prompt(entry["move_sequence"])
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-        # IMPORTANT: match the GRPO prompt format exactly — enable_thinking=True
-        # + `<|channel>thought\n` prefix. Without these the model is conditioned
-        # on a different format than SFT saw, and the strict check fails
-        # spuriously even when SFT worked. Two-step render + tokenize to dodge
-        # Gemma 4's multimodal Processor path; `text=` must be an explicit kwarg
-        # (Unsloth's patched processor routes positional to `images`).
+        # Match the GRPO prompt format exactly: enable_thinking=True puts
+        # `<|think|>` in system; the `<|channel>thought\n` prefix primes
+        # the model to continue inside the thinking channel.
         rendered = tokenizer.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True,
         )
@@ -606,7 +603,11 @@ def run_sft(config, train_data):
         input_ids = tokenizer(text=rendered, return_tensors="pt").input_ids.to(model.device)
         with torch.no_grad():
             outputs = model.generate(input_ids=input_ids, max_new_tokens=256, do_sample=False)
-        response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
+        # Decode WITH special tokens so we can eyeball whether the model
+        # actually emits `<|channel>`, `<channel|>`, `<turn|>` correctly.
+        # Parsing functions (is_thinking_output, extract_column_from_response)
+        # work on either version — they look for a trailing digit.
+        response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=False)
         sample_outputs.append((entry["move_sequence"], entry["best_col"], response, is_thinking_output(response)))
         if is_thinking_output(response):
             correct += 1
@@ -748,66 +749,80 @@ class CurriculumCallback(TrainerCallback):
 # OUTPUT PARSING (handles <think> blocks, expects single digit 0-6)
 # =============================================================================
 
-def strip_thinking(text):
-    """Remove Gemma 4 native thinking blocks from output.
+# Match a single digit 0-6 at the end of a string, with optional trailing
+# whitespace/punctuation. This is what survives `skip_special_tokens=True`
+# decode of a completion that ended with `<channel|>{digit}<turn|>`: only
+# the digit (plus whatever came before the channel opener) remains visible.
+_TRAILING_DIGIT = re.compile(r'([0-6])\s*[.!?,;:\s]*$')
 
-    Matches either the full `<|channel>...<channel|>` wrapper (spontaneous
-    case) or the closing-only `...<channel|>` at the start (when the GRPO
-    prompt prepended `<|channel>thought\\n` so the completion begins mid-
-    block). Also strips legacy `<think>...</think>` literal tags in case
-    any generations still emit them — defensive."""
-    text = re.sub(r'<\|channel>.*?<channel\|>', '', text, flags=re.DOTALL)
-    text = re.sub(r'^.*?<channel\|>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    text = re.sub(r'^.*?</think>', '', text, flags=re.DOTALL)
+# Trailing Gemma 4 (and related) special token strings we strip before
+# matching. If compliance/eval decode with skip_special_tokens=False these
+# tokens appear verbatim; if TRL rewards decode with =True they're gone.
+_SPECIAL_TAIL_TOKENS = (
+    "<turn|>", "<end_of_turn>", "<|end_of_turn|>", "<|endoftext|>",
+    "<channel|>", "<|channel>", "<|think|>",
+)
+
+
+def _strip_trailing_specials(text):
+    """Remove trailing whitespace + any of _SPECIAL_TAIL_TOKENS (repeating)."""
+    out = text.rstrip()
+    changed = True
+    while changed:
+        changed = False
+        for tok in _SPECIAL_TAIL_TOKENS:
+            if out.endswith(tok):
+                out = out[: -len(tok)].rstrip()
+                changed = True
+    return out
+
+
+def strip_thinking(text):
+    """Kept for backward compat; returns text unchanged.
+
+    Rationale: Gemma 4's `<|channel>...<channel|>` block uses special
+    tokens that TRL strips during reward decoding, so there's nothing
+    to strip at reward time. Parsing now relies on _TRAILING_DIGIT at
+    the end of the decoded text instead."""
     return text.strip()
 
 
 def extract_column_from_response(text):
-    """Extract column number (0-6) only if output is a clean single digit."""
-    cleaned = strip_thinking(text).strip()
-    if cleaned in {"0", "1", "2", "3", "4", "5", "6"}:
-        return int(cleaned)
+    """Extract the answer column (0-6) as the LAST digit in the text.
+
+    After decoding (with or without special tokens), the digit sits at
+    the tail. Strip any trailing special-token strings first so the
+    regex anchor-to-end works."""
+    cleaned = _strip_trailing_specials(text)
+    m = _TRAILING_DIGIT.search(cleaned)
+    if m:
+        return int(m.group(1))
     return None
 
 
 def is_clean_output(text):
-    """Check if the output (after thinking) is just a single digit 0-6.
-    LENIENT: accepts a bare digit with no think block — this is the
-    version reward_format uses, since partial credit for digit-only
-    completions lets GRPO differentiate 'wrong column' from 'total
-    nonsense'."""
-    cleaned = strip_thinking(text)
-    return cleaned.strip() in {"0", "1", "2", "3", "4", "5", "6"}
+    """Check if the response ends with a single digit 0-6.
+
+    LENIENT: doesn't care about reasoning content length, just that a
+    digit is there at the end — used by reward_format (if registered)
+    and as a fallback digit-extractability check."""
+    return extract_column_from_response(text) is not None
 
 
 def is_thinking_output(text):
-    """STRICT format check: must have a Gemma 4 channel block with
-    non-trivial content followed by a clean digit 0-6. Used by the SFT
-    compliance check so "20/20 passed" only counts completions that
-    actually learned the format. Accepts either full `<|channel>...<channel|>`
-    (spontaneous) or closing-only `...<channel|>` (when the prompt
-    prepended `<|channel>thought\\n` and completion starts mid-block).
-    Also accepts legacy `<think>...</think>` literal tags, defensively."""
-    patterns = [
-        (r'<\|channel>(.*?)<channel\|>', re.search),
-        (r'^(.*?)<channel\|>', re.match),
-        (r'<think>(.*?)</think>', re.search),
-        (r'^(.*?)</think>', re.match),
-    ]
-    content = None
-    after_start = None
-    for pat, fn in patterns:
-        m = fn(pat, text, re.DOTALL)
-        if m:
-            content = m.group(1).strip()
-            after_start = m.end()
-            break
-    if content is None or after_start is None:
+    """STRICT format check: must end with a digit 0-6 AND have at least
+    some reasoning content before it. Used by the SFT compliance check.
+
+    We can't reliably see the `<channel|>` separator (stripped by TRL in
+    rewards; kept by compliance decode). Approximate: if the text before
+    the trailing digit has >= 5 chars of non-whitespace content, count
+    it as "thought then answered"."""
+    cleaned = _strip_trailing_specials(text)
+    m = _TRAILING_DIGIT.search(cleaned)
+    if not m:
         return False
-    if len(content) < 5:
-        return False
-    return text[after_start:].strip() in {"0", "1", "2", "3", "4", "5", "6"}
+    content_before = cleaned[:m.start()].strip()
+    return len(content_before) >= 5
 
 
 # =============================================================================
@@ -815,11 +830,6 @@ def is_thinking_output(text):
 # =============================================================================
 
 class RewardCalculator:
-    # Matches exactly one digit 0-6 with optional surrounding whitespace and
-    # trailing light punctuation. Accepts "3", "3.", " 3 ", "3\n", "3 !".
-    # Rejects "33", "3 4", "column 3", "The answer is 3".
-    _DIGIT_ONLY = re.compile(r'^\s*([0-6])\s*[.!?,;:\s]*$')
-
     def __init__(self, data, debug_every=1):
         self.score_lookup = build_lookup_table(data)
         self.reward_log = []
@@ -831,28 +841,34 @@ class RewardCalculator:
         self._reward_quality_calls = 0
 
     def reward_closes_and_answers(self, completions, **kwargs):
-        """STRICT format reward. Largest magnitude so it dominates early
-        training — forces the model to converge on "close thinking,
-        then emit ONE clean digit" before chasing move quality.
-          +5.0  : completion has `<channel|>` and the text after it is a
-                  single digit 0-6, with optional trailing whitespace or
-                  light punctuation (".", "!", "?", etc.). Accepts "3",
-                  "3.", " 3 ", "3\n" as equivalent.
-          -10.0 : `<channel|>` present but answer is prose ("column 3",
-                  "The answer is 3", "3 because ...").
-          -20.0 : `<channel|>` never appears (rambled past budget)."""
+        """STRICT format reward — scored on the POST-STRIP decoded text.
+
+        TRL's GRPOTrainer decodes completions with skip_special_tokens=True
+        before passing them here, so `<channel|>` (id 101) is invisible by
+        the time this function runs. The model still learns to emit it at
+        inference (SFT taught that), but we grade on what remains: a
+        reasoning prefix followed by a trailing digit 0-6.
+
+          +5.0  : completion ends in a valid digit and has >= 20 chars of
+                  reasoning before it (full teacher-style answer).
+          -5.0  : completion ends in a valid digit but only 5-19 chars of
+                  content before (minimal reasoning).
+          -10.0 : completion ends in a valid digit with <5 chars before
+                  (bare digit, no reasoning).
+          -20.0 : no trailing digit at all (model never committed)."""
         rewards = []
         for c in completions:
-            if "<channel|>" not in c:
+            cleaned = _strip_trailing_specials(c)
+            m = _TRAILING_DIGIT.search(cleaned)
+            if not m:
                 rewards.append(-20.0)
                 continue
-            after = c.split("<channel|>", 1)[1]
-            # Strip common trailing Gemma 4 turn-end tokens that might survive decode
-            for tail in ("<turn|>", "<end_of_turn>", "<|end_of_turn|>"):
-                if after.endswith(tail):
-                    after = after[: -len(tail)]
-            if self._DIGIT_ONLY.match(after):
+            content_before = cleaned[:m.start()].strip()
+            n = len(content_before)
+            if n >= 20:
                 rewards.append(5.0)
+            elif n >= 5:
+                rewards.append(-5.0)
             else:
                 rewards.append(-10.0)
         return rewards
@@ -1165,7 +1181,9 @@ def run_eval(config, eval_data):
 
         with torch.no_grad():
             outputs = model.generate(input_ids=input_ids, max_new_tokens=256, do_sample=False)
-        response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
+        # skip_special_tokens=False so parsing matches training-time behavior;
+        # extract_column_from_response strips trailing special tokens itself.
+        response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=False)
         col = extract_column_from_response(response)
 
         if col is None:
