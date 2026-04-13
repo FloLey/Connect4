@@ -890,7 +890,7 @@ class RewardCalculator:
              length_factor  = 1.0 at <=600  chars (~150 tokens — very concise)
                             = 0.0 at >=5000 chars (~1250 tokens — long)
                             = linear in between
-        Range [0, 3]. Thresholds scaled for max_completion_length=4096
+        Range [0, 3]. Thresholds scaled for max_completion_length=1024
         (previously 200/1500 for a 1536 cap). Wrong/neutral/losing moves
         (oracle <= 0) get 0, so we never reward being briefly wrong.
         Near-best moves share the bonus proportionally."""
@@ -951,10 +951,24 @@ class RewardCalculator:
                 print(f"    {line}")
             print(f"  oracle scores: {[round(s, 2) for s in oracle_scores]}  best_col={best_col_oracle}")
             print(f"  best of {len(completions)} (idx={best_idx}, parsed_col={best_col_str}, reward={rewards[best_idx]:+.2f}):")
-            # Reconstruct the visible reasoning. The GRPO prompt has
-            # `<|channel>thought\n` prepended, so the completion starts
-            # mid-block — re-add the opening tag for readability.
-            visible = "<|channel>thought\n" + best_completion
+            # Reconstruct the visible separators for readability. Both
+            # `<|channel>thought\n` (opener, was in the prompt prefix) and
+            # `<channel|>` (closer, was between reasoning and digit) are
+            # special tokens stripped by TRL during decode. We insert them
+            # back purely for display; the underlying text in the reward
+            # path is unaffected.
+            cleaned = _strip_trailing_specials(best_completion)
+            m = _TRAILING_DIGIT.search(cleaned)
+            if m is not None:
+                # Split the (possibly un-stripped) completion at the same
+                # offset the trailing-digit regex found in the cleaned text.
+                # The trailing specials are usually 0 chars post-strip, so
+                # indexing by `m.start()` into `best_completion` is safe.
+                split_at = m.start()
+                display = best_completion[:split_at].rstrip() + "<channel|>" + best_completion[split_at:]
+            else:
+                display = best_completion
+            visible = "<|channel>thought\n" + display
             for line in visible.splitlines():
                 print(f"    | {line}")
         return rewards
@@ -1037,7 +1051,7 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     # eyeball whether max_completion_length / max_seq_length are well-sized.
     sample_prompts = [dataset[i]["prompt"] for i in range(min(5, len(dataset)))]
     sample_lens = [len(tokenizer(text=p, return_tensors="pt").input_ids[0]) for p in sample_prompts]
-    print(f"  prompt token lengths (first 5): {sample_lens}  max_completion_length=4096  temperature=1.0")
+    print(f"  prompt token lengths (first 5): {sample_lens}  max_completion_length=1024  temperature=1.0")
     run_name = f"grpo-{config['model_size']}"
 
     # Gaussian curriculum
@@ -1071,7 +1085,7 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
         output_dir=config["grpo_output"],
         temperature=1.0,
         num_generations=config["grpo_num_generations"],
-        max_completion_length=4096,
+        max_completion_length=1024,
         per_device_train_batch_size=config["grpo_batch_size"],
         gradient_accumulation_steps=config["grpo_grad_accum"],
         max_steps=config["grpo_max_steps"],
@@ -1120,7 +1134,7 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     )
 
     print("\nStarting GSPO (Unsloth inference, sequence-level IS)...")
-    print(f"  loss_type={loss_type}  max_completion_length=4096")
+    print(f"  loss_type={loss_type}  max_completion_length=1024")
     print(f"  Curriculum: level 0→9 (easy→hard), advances at {config.get('curriculum_threshold', 0.7):.0%} ratio")
     if hf_repo:
         print(f"  HF auto-push: every save to https://huggingface.co/{hf_repo} (private)")
