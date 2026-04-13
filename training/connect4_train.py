@@ -328,6 +328,49 @@ def prepare_sft_dataset(data, max_rows, tokenizer):
 # SFT — teach the model the output format before GRPO
 # =============================================================================
 
+def _dump_tokenizer_special_tokens(tokenizer, label):
+    """Print the tokenizer's special tokens + whether our literal <think>
+    tags tokenize to a single special-token ID or to ordinary text. This
+    is decisive for diagnosing why SFT greedy might output a bare digit:
+    if <think>/</think> are special tokens, skip_special_tokens=True at
+    decode time would hide them — and if the chat template also strips
+    or rewrites them, SFT is training on a different format than we think."""
+    print(f"\n--- tokenizer special tokens ({label}) ---")
+    try:
+        sm = getattr(tokenizer, "special_tokens_map", None)
+        if sm:
+            for k, v in sm.items():
+                print(f"  {k}: {v!r}")
+        added = getattr(tokenizer, "added_tokens_encoder", None) or getattr(tokenizer, "get_added_vocab", lambda: {})()
+        if callable(added):
+            added = added()
+        if added:
+            print(f"  added_tokens ({len(added)}):")
+            for tok, idx in list(added.items())[:40]:
+                print(f"    {idx:>6}  {tok!r}")
+            if len(added) > 40:
+                print(f"    ... ({len(added)-40} more)")
+    except Exception as e:
+        print(f"  (failed to enumerate: {e})")
+    # Is `<think>` a single special token or multi-piece text?
+    for probe in ("<think>", "</think>", "<|think|>", "<|channel>", "<|channel|>"):
+        try:
+            ids = tokenizer(text=probe, add_special_tokens=False).input_ids
+            back = tokenizer.decode(ids, skip_special_tokens=False)
+            print(f"  probe {probe!r} -> ids={ids}  decoded={back!r}")
+        except Exception as e:
+            print(f"  probe {probe!r} -> error: {e}")
+    print("--- end ---\n")
+
+
+def _dump_first_example(text, label):
+    """Print a full rendered training/inference string so we can eyeball
+    exactly what the model sees, byte for byte. Replaces no characters."""
+    print(f"\n--- first {label} example (raw string, len={len(text)}) ---")
+    print(text)
+    print(f"--- end {label} example ---\n")
+
+
 def load_model_and_tokenizer(config, model_path=None):
     """Load model and tokenizer via Unsloth's FastLanguageModel (text-only)."""
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -392,6 +435,15 @@ def run_sft(config, train_data):
 
     dataset = prepare_sft_dataset(train_data[:5000], 5000, tokenizer)
     print(f"SFT on {len(dataset)} examples (teaching format only)")
+
+    # Diagnostic: what does the Gemma 4 chat template actually produce for
+    # our training examples? And are `<think>`/`</think>` single special
+    # tokens (which skip_special_tokens=True would strip at decode) or
+    # ordinary text? This is the only way to know whether our assumed
+    # format `<think>{thought}</think>\n{digit}` is what SFT really trains on.
+    _dump_tokenizer_special_tokens(tokenizer, label="SFT load")
+    if len(dataset) > 0:
+        _dump_first_example(dataset[0]["text"], label="SFT training")
 
     use_wandb = config.get("use_wandb", False)
     if use_wandb:
@@ -465,7 +517,7 @@ def run_sft(config, train_data):
     # whole 8B base (OOM) or nothing at all. Plain model.eval() leaves the
     # adapter active during forward/generate; model.train() before returning
     # puts dropout back for GSPO.
-    print("\nVerifying format compliance on 20 samples...")
+    print("\nVerifying format compliance on 20 samples (STRICT — must have <think>...</think> + digit)...")
     model.eval()
     correct = 0
     total = 20
@@ -481,13 +533,13 @@ def run_sft(config, train_data):
         rendered = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         input_ids = tokenizer(text=rendered, return_tensors="pt").input_ids.to(model.device)
         with torch.no_grad():
-            outputs = model.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
+            outputs = model.generate(input_ids=input_ids, max_new_tokens=256, do_sample=False)
         response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
-        sample_outputs.append((entry["move_sequence"], entry["best_col"], response, is_clean_output(response)))
-        if is_clean_output(response):
+        sample_outputs.append((entry["move_sequence"], entry["best_col"], response, is_thinking_output(response)))
+        if is_thinking_output(response):
             correct += 1
     pct = 100 * correct / total
-    print(f"  Format compliance: {correct}/{total} ({pct:.0f}%)")
+    print(f"  Format compliance (strict): {correct}/{total} ({pct:.0f}%)")
 
     # Dump every greedy generation so we can eyeball whether the SFT model
     # actually emits `<think>...</think>\n<digit>` or just `<digit>`.
@@ -643,9 +695,35 @@ def extract_column_from_response(text):
 
 
 def is_clean_output(text):
-    """Check if the output (after thinking) is just a single digit 0-6."""
+    """Check if the output (after thinking) is just a single digit 0-6.
+    LENIENT: accepts a bare digit with no think block — this is the
+    version reward_format uses, since partial credit for digit-only
+    completions lets GRPO differentiate 'wrong column' from 'total
+    nonsense'."""
     cleaned = strip_thinking(text)
     return cleaned.strip() in {"0", "1", "2", "3", "4", "5", "6"}
+
+
+def is_thinking_output(text):
+    """STRICT format check: must have <think>{non-trivial content}</think>
+    followed by a clean digit 0-6. Used by the SFT compliance check so
+    "20/20 passed" only counts completions that actually learned the
+    format — not ones that skipped the wrapper entirely. Accepts either
+    `<think>...</think>` (spontaneous) or `...</think>` (when the prompt
+    prefixed `<think>` and the completion starts mid-block)."""
+    m_full = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
+    m_close = re.match(r'^(.*?)</think>', text, re.DOTALL)
+    if m_full:
+        content = m_full.group(1).strip()
+        after = text[m_full.end():]
+    elif m_close:
+        content = m_close.group(1).strip()
+        after = text[m_close.end():]
+    else:
+        return False
+    if len(content) < 5:
+        return False
+    return after.strip() in {"0", "1", "2", "3", "4", "5", "6"}
 
 
 # =============================================================================
@@ -791,6 +869,15 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     reward_calc = RewardCalculator(train_data)
     print(f"Training on {len(train_data)} positions, {len(reward_calc.score_lookup)} in lookup")
     dataset = prepare_grpo_dataset(train_data, config["grpo_max_rows"], tokenizer)
+
+    # Diagnostic: dump the first rendered GRPO prompt verbatim. This is
+    # exactly what the model is conditioned on at rollout time. Compare
+    # against the SFT training example dump to confirm byte-for-byte
+    # alignment (the assistant turn header + <think> prefix must match
+    # what SFT saw after `<start_of_turn>model\n`).
+    _dump_tokenizer_special_tokens(tokenizer, label="GRPO load")
+    if len(dataset) > 0:
+        _dump_first_example(dataset[0]["prompt"], label="GRPO prompt")
 
     # One-shot sanity: report prompt token length on a few examples so we can
     # eyeball whether max_completion_length / max_seq_length are well-sized.
