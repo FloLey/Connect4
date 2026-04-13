@@ -421,6 +421,23 @@ def run_sft(config, train_data):
     tokenizer.save_pretrained(sft_dir)
     print(f"SFT LoRA adapter saved to {sft_dir}")
 
+    # Push SFT adapter to HF as <hf_repo>-sft so it survives pod restarts
+    # and so a future --stage grpo run on a fresh pod can pull it.
+    hf_repo = config.get("hf_repo")
+    if hf_repo and HF_AVAILABLE:
+        sft_repo = f"{hf_repo}-sft"
+        try:
+            print(f"Pushing SFT adapter to https://huggingface.co/{sft_repo} (private)")
+            create_repo(sft_repo, exist_ok=True, private=True)
+            HfApi().upload_folder(
+                folder_path=sft_dir,
+                repo_id=sft_repo,
+                commit_message=f"SFT format warmup ({config['model_size']})",
+            )
+            print(f"  -> https://huggingface.co/{sft_repo}")
+        except Exception as e:
+            print(f"WARNING: SFT adapter push failed ({e}). Local copy still at {sft_dir}.")
+
     # Verify format compliance using the PEFT-wrapped model directly — DO NOT
     # merge_and_unload. merge_and_unload() mutates `model` to no longer be a
     # PeftModel (adapter layers removed, weights merged into base), so we'd
@@ -432,6 +449,7 @@ def run_sft(config, train_data):
     model.eval()
     correct = 0
     total = 20
+    sample_outputs = []
     for entry in train_data[:total]:
         system_msg, user_msg = build_prompt(entry["move_sequence"])
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
@@ -443,12 +461,24 @@ def run_sft(config, train_data):
         rendered = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         input_ids = tokenizer(text=rendered, return_tensors="pt").input_ids.to(model.device)
         with torch.no_grad():
-            outputs = model.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
+            outputs = model.generate(input_ids=input_ids, max_new_tokens=256, do_sample=False)
         response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
+        sample_outputs.append((entry["move_sequence"], entry["best_col"], response, is_clean_output(response)))
         if is_clean_output(response):
             correct += 1
     pct = 100 * correct / total
     print(f"  Format compliance: {correct}/{total} ({pct:.0f}%)")
+
+    # Dump every greedy generation so we can eyeball whether the SFT model
+    # actually emits `<think>...</think>\n<digit>` or just `<digit>`.
+    print("\n--- 20 compliance-check generations (greedy) ---")
+    for i, (seq, best, resp, ok) in enumerate(sample_outputs):
+        flag = "OK " if ok else "BAD"
+        print(f"\n[{flag} {i+1}/{total}] move_seq={seq!r} best_col={best}")
+        print(f"  raw response (len={len(resp)} chars):")
+        for line in resp.splitlines() or [""]:
+            print(f"    {line}")
+    print("--- end ---\n")
 
     # Drop trainer + dataset; keep `model` (PEFT-wrapped, SFT-trained) and
     # `tokenizer` — main() passes them straight into run_grpo.
@@ -658,32 +688,33 @@ class RewardCalculator:
             if max_reward is not None:
                 self.max_reward_log.append(max_reward[i])
 
-        # Debug print: board + ALL completions with their rewards. All
-        # completions in this call belong to the same group (we set
-        # per_device_train_batch_size == num_generations) so they share
-        # the same move_sequence / board / oracle scores.
+        # Debug print: board + the BEST of the N completions (full text,
+        # no truncation, with the prompt-prefixed `<think>` shown explicitly
+        # so the full thinking + answer is readable). All completions in this
+        # call belong to the same group (we set per_device_train_batch_size
+        # == num_generations) so they share the same board / oracle scores.
         self._reward_quality_calls += 1
         if self._debug_every and self._reward_quality_calls % self._debug_every == 0 and rewards:
-            # Use the first entry's move_sequence — in the usual config all
-            # entries share it, but fall back gracefully if not.
             seq = move_sequence[0]
             game = reconstruct_board(seq)
             oracle_scores = self.score_lookup.get(seq, [0.0]*7)
             best_col_oracle = max(range(7), key=lambda c: oracle_scores[c])
+            best_idx = max(range(len(rewards)), key=lambda k: rewards[k])
+            best_completion = completions[best_idx]
+            best_col_parsed = extract_column_from_response(best_completion)
+            best_col_str = str(best_col_parsed) if best_col_parsed is not None else "?"
             print(f"\n[step {self._reward_quality_calls}] move_seq={seq!r} (len={len(seq)})")
             print(f"  board:")
             for line in game.get_visual_board().splitlines():
                 print(f"    {line}")
             print(f"  oracle scores: {[round(s, 2) for s in oracle_scores]}  best_col={best_col_oracle}")
-            print(f"  completions ({len(completions)} generations):")
-            for k, (c, r) in enumerate(zip(completions, rewards)):
-                # Truncate very long completions to keep log readable
-                disp = c if len(c) <= 150 else c[:150] + "..."
-                # Escape newlines inside completions for single-line display
-                disp = disp.replace("\n", "\\n")
-                col_parsed = extract_column_from_response(c)
-                col_str = str(col_parsed) if col_parsed is not None else "?"
-                print(f"    [{k}] col={col_str} reward={r:+6.2f}  {disp!r}")
+            print(f"  best of {len(completions)} (idx={best_idx}, parsed_col={best_col_str}, reward={rewards[best_idx]:+.2f}):")
+            # Reconstruct the visible reasoning. The GRPO prompt has `<think>`
+            # prepended, so the completion starts mid-block — re-add the
+            # opening tag for readability.
+            visible = "<think>" + best_completion
+            for line in visible.splitlines():
+                print(f"    | {line}")
         return rewards
 
 
@@ -702,13 +733,23 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     #    PeftModel.from_pretrained either crashes (Gemma4ClippableLinear not
     #    supported by stock peft) or silently loses the SFT weights (8-bit
     #    merge-and-unload quantizes the delta back into int8).
-    # 2. --stage grpo on a fresh pod where an SFT adapter dir exists on disk —
-    #    best-effort: load base + adapter via Unsloth. Known lossy through
-    #    the 8-bit round-trip but keeps the resume-after-pod-death promise.
-    # 3. --stage grpo with no SFT on disk — cold start.
+    # 2. --stage grpo on a fresh pod where an SFT adapter dir exists on disk
+    #    locally OR is downloadable from `<hf_repo>-sft` on the Hub — pull it
+    #    via Unsloth's FastLanguageModel(adapter_dir).
+    # 3. --stage grpo with no SFT anywhere — cold start from base Gemma 4.
     if model is None or tokenizer is None:
         sft_dir = config["grpo_output"] + "_sft"
         sft_adapter_config = os.path.join(sft_dir, "adapter_config.json")
+        # If local SFT is missing but --hf-repo is set, try to pull from
+        # <hf_repo>-sft (where run_sft pushes after training).
+        if not os.path.exists(sft_adapter_config) and config.get("hf_repo") and HF_AVAILABLE:
+            sft_repo = f"{config['hf_repo']}-sft"
+            try:
+                from huggingface_hub import snapshot_download
+                print(f"  No local SFT adapter — pulling from https://huggingface.co/{sft_repo}")
+                snapshot_download(repo_id=sft_repo, local_dir=sft_dir)
+            except Exception as e:
+                print(f"  Could not pull SFT adapter from {sft_repo}: {e}")
         if os.path.exists(sft_adapter_config):
             print(f"  Loading base + SFT LoRA adapter from {sft_dir} (resume path)")
             model, tokenizer = FastLanguageModel.from_pretrained(
@@ -767,9 +808,13 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     hf_repo = config.get("hf_repo")
     grpo_kwargs = dict(
         output_dir=config["grpo_output"],
-        temperature=1.0,
+        # Lower T (was 1.0) keeps sampling close to SFT-learned distribution
+        # so the model produces teacher-style think blocks instead of drifting
+        # into base-Gemma "Row 0: . | . |..." board narration that never closes.
+        # Shorter max_completion_length forces concision and bounds rollout cost.
+        temperature=0.7,
         num_generations=config["grpo_num_generations"],
-        max_completion_length=512,
+        max_completion_length=256,
         per_device_train_batch_size=config["grpo_batch_size"],
         gradient_accumulation_steps=config["grpo_grad_accum"],
         max_steps=config["grpo_max_steps"],
