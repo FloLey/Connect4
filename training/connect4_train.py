@@ -812,6 +812,11 @@ def is_thinking_output(text):
 # =============================================================================
 
 class RewardCalculator:
+    # Matches exactly one digit 0-6 with optional surrounding whitespace and
+    # trailing light punctuation. Accepts "3", "3.", " 3 ", "3\n", "3 !".
+    # Rejects "33", "3 4", "column 3", "The answer is 3".
+    _DIGIT_ONLY = re.compile(r'^\s*([0-6])\s*[.!?,;:\s]*$')
+
     def __init__(self, data, debug_every=1):
         self.score_lookup = build_lookup_table(data)
         self.reward_log = []
@@ -826,23 +831,24 @@ class RewardCalculator:
         """STRICT format reward. Largest magnitude so it dominates early
         training — forces the model to converge on "close thinking,
         then emit ONE clean digit" before chasing move quality.
-          +5.0  : completion has `<channel|>` and the text after it is
-                  exactly a digit 0-6 (optional whitespace/turn-end OK).
-          -10.0 : `<channel|>` present but the answer after it is malformed
-                  (e.g. "The answer is 3", "column 3", etc.).
-          -20.0 : `<channel|>` never appears — the model rambled past
-                  max_completion_length without closing its thinking."""
+          +5.0  : completion has `<channel|>` and the text after it is a
+                  single digit 0-6, with optional trailing whitespace or
+                  light punctuation (".", "!", "?", etc.). Accepts "3",
+                  "3.", " 3 ", "3\n" as equivalent.
+          -10.0 : `<channel|>` present but answer is prose ("column 3",
+                  "The answer is 3", "3 because ...").
+          -20.0 : `<channel|>` never appears (rambled past budget)."""
         rewards = []
         for c in completions:
             if "<channel|>" not in c:
                 rewards.append(-20.0)
                 continue
-            after = c.split("<channel|>", 1)[1].strip()
+            after = c.split("<channel|>", 1)[1]
             # Strip common trailing Gemma 4 turn-end tokens that might survive decode
             for tail in ("<turn|>", "<end_of_turn>", "<|end_of_turn|>"):
                 if after.endswith(tail):
-                    after = after[: -len(tail)].strip()
-            if after in {"0", "1", "2", "3", "4", "5", "6"}:
+                    after = after[: -len(tail)]
+            if self._DIGIT_ONLY.match(after):
                 rewards.append(5.0)
             else:
                 rewards.append(-10.0)
@@ -859,11 +865,16 @@ class RewardCalculator:
         return rewards
 
     def reward_conciseness(self, completions, move_sequence, **kwargs):
-        """Bonus for CORRECT answers reached with less thinking.
-        Only fires when the parsed column matches the oracle's best move,
-        so we never push wrong answers to get shorter. Among correct
-        answers: linear decay +3.0 at ≤200 chars → 0 at ≥1500 chars.
-        Encourages the model to reach the right conclusion quickly."""
+        """Bonus for length-efficient GOOD answers.
+          reward = 3.0 * quality_factor * length_factor
+             quality_factor = max(0, oracle_score[col])  in [0, 1]
+             length_factor  = 1.0 at <=200 chars
+                            = 0.0 at >=1500 chars
+                            = linear in between
+        Range [0, 3]. Wrong/neutral/losing moves (oracle <= 0) get 0, so
+        we never reward being briefly wrong. Near-best moves share the
+        bonus proportionally with the oracle's score — continuous, not
+        binary best/not-best."""
         rewards = []
         for c, seq in zip(completions, move_sequence):
             col = extract_column_from_response(c)
@@ -871,17 +882,19 @@ class RewardCalculator:
                 rewards.append(0.0)
                 continue
             scores = self.score_lookup.get(seq, [0.0] * 7)
-            best_oracle = max(range(7), key=lambda i: scores[i])
-            if col != best_oracle:
-                rewards.append(0.0)   # wrong answer — no bonus at all
+            oracle = scores[col]
+            if oracle <= 0:
+                rewards.append(0.0)
                 continue
+            quality_factor = oracle  # already in (0, 1]
             n = len(c)
             if n <= 200:
-                rewards.append(3.0)
+                length_factor = 1.0
             elif n >= 1500:
-                rewards.append(0.0)
+                length_factor = 0.0
             else:
-                rewards.append(3.0 * (1500 - n) / 1300)
+                length_factor = (1500 - n) / 1300.0
+            rewards.append(3.0 * quality_factor * length_factor)
         return rewards
 
     def reward_move_quality(self, completions, move_sequence, max_reward=None, **kwargs):
