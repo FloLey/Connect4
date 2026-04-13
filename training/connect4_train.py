@@ -250,13 +250,37 @@ FILLER_THOUGHTS = [
 ]
 
 
-def _load_thoughts_jsonl(path="connect4_thoughts.jsonl"):
-    """Load teacher-model generated thoughts keyed by move_sequence.
-    Returns an empty dict if the file doesn't exist — SFT falls back to
-    the generic FILLER_THOUGHTS in that case."""
+def _load_thoughts():
+    """Load teacher-model reasoning traces. Primary source is the HF dataset
+    Betha/connect4-thoughts; local JSONL at training/connect4_thoughts.jsonl
+    is a fallback for when HF is unreachable.
+
+    Returns a list of dicts, each with keys: move_sequence, best_col, thought.
+    This is everything SFT needs — no CSV lookup required, so no chance of
+    the move_sequence-lookup mismatch class of bugs.
+    """
+    # Try HF first
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("Betha/connect4-thoughts", split="train")
+        print(f"SFT: loaded {len(ds)} teacher thoughts from HF dataset Betha/connect4-thoughts")
+        return [
+            {
+                "move_sequence": row["move_sequence"],
+                "best_col": int(row["best_col"]),
+                "thought": row["thought"].strip(),
+            }
+            for row in ds
+            if row.get("move_sequence") and row.get("thought")
+        ]
+    except Exception as e:
+        print(f"SFT: HF load failed ({e}) — falling back to local connect4_thoughts.jsonl")
+
+    path = "connect4_thoughts.jsonl"
     if not os.path.exists(path):
-        return {}
-    out = {}
+        print(f"SFT: no HF dataset and no local {path} — falling back to FILLER_THOUGHTS (no per-position reasoning)")
+        return []
+    out = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -268,48 +292,42 @@ def _load_thoughts_jsonl(path="connect4_thoughts.jsonl"):
                 continue
             seq = obj.get("move_sequence")
             thought = obj.get("thought")
-            if seq and thought:
-                out[seq] = thought.strip()
+            best_col = obj.get("best_col")
+            if seq and thought and best_col is not None:
+                out.append({"move_sequence": seq, "best_col": int(best_col), "thought": thought.strip()})
+    print(f"SFT: loaded {len(out)} teacher thoughts from local {path}")
     return out
 
 
-def prepare_sft_dataset(data, max_rows, tokenizer):
-    rng = random.Random(42)
-    thoughts = _load_thoughts_jsonl()
-    # Build a lookup: move_sequence -> entry so we can resolve each thought's
-    # best_col / board reconstruction without depending on the order of `data`.
-    data_by_seq = {e["move_sequence"]: e for e in data}
+def prepare_sft_dataset(tokenizer):
+    """Build the SFT dataset purely from teacher thoughts. No CSV dependency —
+    each row of the thoughts dataset already contains move_sequence, best_col,
+    and the Gemini-generated reasoning, which is everything SFT needs.
 
+    Falls back to the generic FILLER_THOUGHTS list only when no thoughts can
+    be loaded at all (neither HF nor local JSONL)."""
+    thoughts = _load_thoughts()
     formatted = []
     if thoughts:
-        # DRIVE the dataset from the thoughts, not from data[:max_rows]. The
-        # thoughts JSONL is expensive to produce (Gemini calls), so we want
-        # to use every trace we have. generate_thoughts.py and split_data
-        # historically picked DIFFERENT "first 5000" subsets (one shuffled,
-        # one shuffled+sort_by_difficulty), so only a handful of thoughts
-        # aligned under the previous lookup-based flow — the rest silently
-        # fell back to generic filler. Iterating the thoughts fixes this.
-        thought_orphans = 0
-        for seq, thought in thoughts.items():
-            entry = data_by_seq.get(seq)
-            if entry is None:
-                thought_orphans += 1
-                continue
+        for row in thoughts:
+            seq = row["move_sequence"]
             system_msg, user_msg = build_prompt(seq)
-            best_col = entry["best_col"]
             conv = [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": f"<think>{thought}</think>\n{best_col}"},
+                {"role": "assistant", "content": f"<think>{row['thought']}</think>\n{row['best_col']}"},
             ]
             formatted.append({
                 "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False),
             })
-        print(f"SFT: built {len(formatted)} examples from {len(thoughts)} teacher thoughts "
-              f"({thought_orphans} thoughts had no matching position in train split)")
+        print(f"SFT: built {len(formatted)} examples from teacher thoughts (zero CSV lookup)")
     else:
-        print("SFT: no connect4_thoughts.jsonl found — using generic FILLER_THOUGHTS fallback")
-        for entry in data[:max_rows]:
+        print("SFT: WARNING — no teacher thoughts available. Falling back to generic FILLER_THOUGHTS on the first 1000 CSV rows. This is NOT recommended.")
+        raw = load_csv_data("connect4_data.csv")
+        random.seed(42)
+        random.shuffle(raw)
+        rng = random.Random(42)
+        for entry in raw[:1000]:
             system_msg, user_msg = build_prompt(entry["move_sequence"])
             thought = rng.choice(FILLER_THOUGHTS)
             best_col = entry["best_col"]
@@ -352,8 +370,12 @@ def _dump_tokenizer_special_tokens(tokenizer, label):
                 print(f"    ... ({len(added)-40} more)")
     except Exception as e:
         print(f"  (failed to enumerate: {e})")
-    # Is `<think>` a single special token or multi-piece text?
-    for probe in ("<think>", "</think>", "<|think|>", "<|channel>", "<|channel|>"):
+    # Is `<think>` a single special token or multi-piece text? Probe several
+    # Gemma 4 candidate tags too so we know the EXACT closing form.
+    for probe in ("<think>", "</think>",
+                  "<|think|>", "<|/think|>",
+                  "<|channel>", "<channel|>", "<|channel|>", "<|/channel|>",
+                  "<|turn>", "<turn|>"):
         try:
             ids = tokenizer(text=probe, add_special_tokens=False).input_ids
             back = tokenizer.decode(ids, skip_special_tokens=False)
@@ -361,6 +383,37 @@ def _dump_tokenizer_special_tokens(tokenizer, label):
         except Exception as e:
             print(f"  probe {probe!r} -> error: {e}")
     print("--- end ---\n")
+
+
+def _dump_native_thinking_render(tokenizer):
+    """Render a toy conversation with enable_thinking=True (if supported by
+    Gemma 4's chat template) so we can see the canonical native-thinking
+    format and then do a clean find-replace from our literal <think>
+    tags to whatever the native wrapper actually is."""
+    print("\n--- native thinking render (apply_chat_template enable_thinking=True) ---")
+    conv = [
+        {"role": "system", "content": "Demo system prompt."},
+        {"role": "user", "content": "Demo user message."},
+        {"role": "assistant", "content": "Some reasoning goes here.\n3"},
+    ]
+    # Try several commonly-seen invocations; whichever works will produce
+    # a rendered string the others won't. Fail gracefully.
+    tries = [
+        ("default (no thinking flag)", {}),
+        ("enable_thinking=True", {"enable_thinking": True}),
+        ("enable_thinking=False", {"enable_thinking": False}),
+        ("chat_template='gemma-4-thinking'", {"chat_template": "gemma-4-thinking"}),
+    ]
+    for label, kwargs in tries:
+        try:
+            text = tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False, **kwargs)
+            print(f"\n  [{label}]  len={len(text)}")
+            print(text)
+        except TypeError as e:
+            print(f"\n  [{label}]  unsupported: {e}")
+        except Exception as e:
+            print(f"\n  [{label}]  failed: {e}")
+    print("--- end native render ---\n")
 
 
 def _dump_first_example(text, label):
@@ -433,7 +486,10 @@ def run_sft(config, train_data):
     model, tokenizer = load_model_and_tokenizer(config)
     model = apply_lora(model, config)
 
-    dataset = prepare_sft_dataset(train_data[:5000], 5000, tokenizer)
+    # prepare_sft_dataset builds from the HF thoughts dataset directly; no
+    # CSV / train_data lookup needed (each row already has move_sequence,
+    # best_col, and thought).
+    dataset = prepare_sft_dataset(tokenizer)
     print(f"SFT on {len(dataset)} examples (teaching format only)")
 
     # Diagnostic: what does the Gemma 4 chat template actually produce for
@@ -442,6 +498,7 @@ def run_sft(config, train_data):
     # ordinary text? This is the only way to know whether our assumed
     # format `<think>{thought}</think>\n{digit}` is what SFT really trains on.
     _dump_tokenizer_special_tokens(tokenizer, label="SFT load")
+    _dump_native_thinking_render(tokenizer)
     if len(dataset) > 0:
         _dump_first_example(dataset[0]["text"], label="SFT training")
 
