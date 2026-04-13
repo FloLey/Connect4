@@ -461,7 +461,7 @@ def run_sft(config, train_data):
         rendered = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         input_ids = tokenizer(text=rendered, return_tensors="pt").input_ids.to(model.device)
         with torch.no_grad():
-            outputs = model.generate(input_ids=input_ids, max_new_tokens=256, do_sample=False)
+            outputs = model.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
         response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
         sample_outputs.append((entry["move_sequence"], entry["best_col"], response, is_clean_output(response)))
         if is_clean_output(response):
@@ -808,13 +808,9 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     hf_repo = config.get("hf_repo")
     grpo_kwargs = dict(
         output_dir=config["grpo_output"],
-        # Lower T (was 1.0) keeps sampling close to SFT-learned distribution
-        # so the model produces teacher-style think blocks instead of drifting
-        # into base-Gemma "Row 0: . | . |..." board narration that never closes.
-        # Shorter max_completion_length forces concision and bounds rollout cost.
-        temperature=0.7,
+        temperature=1.0,
         num_generations=config["grpo_num_generations"],
-        max_completion_length=256,
+        max_completion_length=512,
         per_device_train_batch_size=config["grpo_batch_size"],
         gradient_accumulation_steps=config["grpo_grad_accum"],
         max_steps=config["grpo_max_steps"],
