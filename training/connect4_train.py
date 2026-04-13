@@ -316,18 +316,22 @@ def prepare_sft_dataset(tokenizer):
         for row in thoughts:
             seq = row["move_sequence"]
             system_msg, user_msg = build_prompt(seq)
-            # Gemma 4 native thinking format: <|channel>thought\n...<channel|>
-            # <|channel> (id 100) and <channel|> (id 101) are single special
-            # tokens with strong pretrained priors, so SFT only has to nudge
-            # the model — not teach from scratch as it would for literal text.
-            conv = [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": f"<|channel>thought\n{row['thought']}<channel|>{row['best_col']}"},
-            ]
-            formatted.append({
-                "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False, enable_thinking=True),
-            })
+            # CRITICAL: Gemma 4's chat template STRIPS <|channel>...<channel|>
+            # blocks from any assistant turn it renders (the "hide historical
+            # thinking" design). If we pass the full 3-turn conv with the
+            # thinking wrapped in channel tags, the template emits only the
+            # bare digit after <|turn>model — SFT trains on nothing useful.
+            #
+            # Fix: render just system+user with add_generation_prompt=True
+            # (which ends with "<|turn>model\n") and MANUALLY append the
+            # assistant turn ourselves so the channel block survives intact.
+            prompt_text = tokenizer.apply_chat_template(
+                [{"role": "system", "content": system_msg},
+                 {"role": "user", "content": user_msg}],
+                tokenize=False, add_generation_prompt=True, enable_thinking=True,
+            )
+            completion_text = f"<|channel>thought\n{row['thought']}<channel|>{row['best_col']}<turn|>"
+            formatted.append({"text": prompt_text + completion_text})
         print(f"SFT: built {len(formatted)} examples from teacher thoughts (zero CSV lookup)")
     else:
         print("SFT: WARNING — no teacher thoughts available. Falling back to generic FILLER_THOUGHTS on the first 1000 CSV rows. This is NOT recommended.")
@@ -339,14 +343,13 @@ def prepare_sft_dataset(tokenizer):
             system_msg, user_msg = build_prompt(entry["move_sequence"])
             thought = rng.choice(FILLER_THOUGHTS)
             best_col = entry["best_col"]
-            conv = [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": f"<|channel>thought\n{thought}<channel|>{best_col}"},
-            ]
-            formatted.append({
-                "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False, enable_thinking=True),
-            })
+            prompt_text = tokenizer.apply_chat_template(
+                [{"role": "system", "content": system_msg},
+                 {"role": "user", "content": user_msg}],
+                tokenize=False, add_generation_prompt=True, enable_thinking=True,
+            )
+            completion_text = f"<|channel>thought\n{thought}<channel|>{best_col}<turn|>"
+            formatted.append({"text": prompt_text + completion_text})
     return Dataset.from_list(formatted)
 
 
