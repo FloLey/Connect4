@@ -590,12 +590,16 @@ def run_sft(config, train_data):
     for entry in train_data[:total]:
         system_msg, user_msg = build_prompt(entry["move_sequence"])
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-        # Two-step render + tokenize to dodge Gemma 4's multimodal Processor path.
-        # `text=` must be an explicit kwarg: Unsloth's patched processor __call__
-        # has signature (self, images=None, text=None, videos=None, **kwargs), so
-        # a positional arg gets routed to `images` and `text` ends up None — which
-        # then crashes inside Gemma4Processor doing text[0].
-        rendered = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        # IMPORTANT: match the GRPO prompt format exactly — enable_thinking=True
+        # + `<|channel>thought\n` prefix. Without these the model is conditioned
+        # on a different format than SFT saw, and the strict check fails
+        # spuriously even when SFT worked. Two-step render + tokenize to dodge
+        # Gemma 4's multimodal Processor path; `text=` must be an explicit kwarg
+        # (Unsloth's patched processor routes positional to `images`).
+        rendered = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True,
+        )
+        rendered = rendered + "<|channel>thought\n"
         input_ids = tokenizer(text=rendered, return_tensors="pt").input_ids.to(model.device)
         with torch.no_grad():
             outputs = model.generate(input_ids=input_ids, max_new_tokens=256, do_sample=False)
@@ -1095,13 +1099,18 @@ def run_eval(config, eval_data):
 
         system_msg, user_msg = build_prompt(seq)
         msgs = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-        # See run_sft: must pass `text=` as explicit kwarg through Unsloth's
-        # patched Gemma 4 Processor call.
-        rendered = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        # Match SFT + GRPO prompt format: enable_thinking=True so <|think|>
+        # lands in the system turn, and prefix `<|channel>thought\n` so the
+        # model continues inside a thinking channel. max_new_tokens=256 so
+        # a full reasoning block + `<channel|>` + digit fits.
+        rendered = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True,
+        )
+        rendered = rendered + "<|channel>thought\n"
         input_ids = tokenizer(text=rendered, return_tensors="pt").input_ids.to(model.device)
 
         with torch.no_grad():
-            outputs = model.generate(input_ids=input_ids, max_new_tokens=128, do_sample=False)
+            outputs = model.generate(input_ids=input_ids, max_new_tokens=256, do_sample=False)
         response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
         col = extract_column_from_response(response)
 
