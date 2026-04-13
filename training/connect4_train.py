@@ -97,7 +97,7 @@ def reconstruct_board(move_sequence):
 # PRODUCTION PROMPT TEMPLATES
 # =============================================================================
 
-SYSTEM_TEMPLATE = """You are an expert Connect Four player. Board: 6 rows x 7 columns. Gravity: pieces fall to lowest empty slot. Goal: connect 4 in a row. You are Player {player_id} ({symbol}). Reply with just the column number (0-6)."""
+SYSTEM_TEMPLATE = """You are an expert Connect Four player. Board: 6 rows x 7 columns. Gravity: pieces fall to lowest empty slot. Goal: connect 4 in a row. You are Player {player_id} ({symbol}). Think briefly about the position, then when you have decided emit `<channel|>` followed by exactly the column number (0-6), and nothing else."""
 
 USER_TEMPLATE = """{visual_board}
 
@@ -868,13 +868,13 @@ class RewardCalculator:
         """Bonus for length-efficient GOOD answers.
           reward = 3.0 * quality_factor * length_factor
              quality_factor = max(0, oracle_score[col])  in [0, 1]
-             length_factor  = 1.0 at <=200 chars
-                            = 0.0 at >=1500 chars
+             length_factor  = 1.0 at <=600  chars (~150 tokens — very concise)
+                            = 0.0 at >=5000 chars (~1250 tokens — long)
                             = linear in between
-        Range [0, 3]. Wrong/neutral/losing moves (oracle <= 0) get 0, so
-        we never reward being briefly wrong. Near-best moves share the
-        bonus proportionally with the oracle's score — continuous, not
-        binary best/not-best."""
+        Range [0, 3]. Thresholds scaled for max_completion_length=4096
+        (previously 200/1500 for a 1536 cap). Wrong/neutral/losing moves
+        (oracle <= 0) get 0, so we never reward being briefly wrong.
+        Near-best moves share the bonus proportionally."""
         rewards = []
         for c, seq in zip(completions, move_sequence):
             col = extract_column_from_response(c)
@@ -888,12 +888,12 @@ class RewardCalculator:
                 continue
             quality_factor = oracle  # already in (0, 1]
             n = len(c)
-            if n <= 200:
+            if n <= 600:
                 length_factor = 1.0
-            elif n >= 1500:
+            elif n >= 5000:
                 length_factor = 0.0
             else:
-                length_factor = (1500 - n) / 1300.0
+                length_factor = (5000 - n) / 4400.0
             rewards.append(3.0 * quality_factor * length_factor)
         return rewards
 
@@ -1018,7 +1018,7 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     # eyeball whether max_completion_length / max_seq_length are well-sized.
     sample_prompts = [dataset[i]["prompt"] for i in range(min(5, len(dataset)))]
     sample_lens = [len(tokenizer(text=p, return_tensors="pt").input_ids[0]) for p in sample_prompts]
-    print(f"  prompt token lengths (first 5): {sample_lens}  max_completion_length=1536  temperature=1.0")
+    print(f"  prompt token lengths (first 5): {sample_lens}  max_completion_length=4096  temperature=1.0")
     run_name = f"grpo-{config['model_size']}"
 
     # Gaussian curriculum
@@ -1052,7 +1052,7 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
         output_dir=config["grpo_output"],
         temperature=1.0,
         num_generations=config["grpo_num_generations"],
-        max_completion_length=1536,
+        max_completion_length=4096,
         per_device_train_batch_size=config["grpo_batch_size"],
         gradient_accumulation_steps=config["grpo_grad_accum"],
         max_steps=config["grpo_max_steps"],
@@ -1101,7 +1101,7 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     )
 
     print("\nStarting GSPO (Unsloth inference, sequence-level IS)...")
-    print(f"  loss_type={loss_type}  max_completion_length=1536")
+    print(f"  loss_type={loss_type}  max_completion_length=4096")
     print(f"  Curriculum: level 0→9 (easy→hard), advances at {config.get('curriculum_threshold', 0.7):.0%} ratio")
     if hf_repo:
         print(f"  HF auto-push: every save to https://huggingface.co/{hf_repo} (private)")
