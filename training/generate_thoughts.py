@@ -287,17 +287,26 @@ def main():
         print("Create a .env with GOOGLE_API_KEY=your-key in one of: ./, training/, backend/, ../", file=sys.stderr)
         sys.exit(1)
 
-    # Load + sample positions. Use the same seed+shuffle as split_data so
-    # we cover the first N of the training side (easy to hardest bucket).
+    # Load + sample positions. Must match connect4_train.split_data EXACTLY:
+    #   shuffle(seed=42) -> eval=last_10k -> train=sort_by_difficulty(rest, +std desc)
+    # Otherwise the move_sequences we label don't line up with the positions
+    # SFT actually trains on, and prepare_sft_dataset ends up using almost
+    # none of the traces.
     raw = load_csv_data(args.csv)
     print(f"Loaded {len(raw)} positions from {args.csv}")
     random.seed(args.seed)
     random.shuffle(raw)
-    # Reserve the last 10k as eval (same as split_data); pull from the
-    # training side so our thoughts align with the SFT training set.
-    train = raw[:-10_000]
+    train_unsorted = raw[:-10_000]
+
+    def _diff_score(e):
+        """Std of the 7 column scores — matches connect4_train.difficulty_score."""
+        s = e["scores"]
+        m = sum(s) / len(s)
+        return (sum((x - m) ** 2 for x in s) / len(s)) ** 0.5
+
+    train = sorted(train_unsorted, key=_diff_score, reverse=True)   # easy (high std) first
     subset = train[: args.n]
-    print(f"Targeting {len(subset)} training positions for teacher traces")
+    print(f"Targeting {len(subset)} training positions for teacher traces (sorted: easy → hard)")
 
     # Resume: drop already-done move_sequences
     done = load_existing_thoughts(args.out)

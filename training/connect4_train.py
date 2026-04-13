@@ -276,31 +276,51 @@ def _load_thoughts_jsonl(path="connect4_thoughts.jsonl"):
 def prepare_sft_dataset(data, max_rows, tokenizer):
     rng = random.Random(42)
     thoughts = _load_thoughts_jsonl()
+    # Build a lookup: move_sequence -> entry so we can resolve each thought's
+    # best_col / board reconstruction without depending on the order of `data`.
+    data_by_seq = {e["move_sequence"]: e for e in data}
+
+    formatted = []
     if thoughts:
-        print(f"SFT: loaded {len(thoughts)} teacher thoughts from connect4_thoughts.jsonl")
+        # DRIVE the dataset from the thoughts, not from data[:max_rows]. The
+        # thoughts JSONL is expensive to produce (Gemini calls), so we want
+        # to use every trace we have. generate_thoughts.py and split_data
+        # historically picked DIFFERENT "first 5000" subsets (one shuffled,
+        # one shuffled+sort_by_difficulty), so only a handful of thoughts
+        # aligned under the previous lookup-based flow — the rest silently
+        # fell back to generic filler. Iterating the thoughts fixes this.
+        thought_orphans = 0
+        for seq, thought in thoughts.items():
+            entry = data_by_seq.get(seq)
+            if entry is None:
+                thought_orphans += 1
+                continue
+            system_msg, user_msg = build_prompt(seq)
+            best_col = entry["best_col"]
+            conv = [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f"<think>{thought}</think>\n{best_col}"},
+            ]
+            formatted.append({
+                "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False),
+            })
+        print(f"SFT: built {len(formatted)} examples from {len(thoughts)} teacher thoughts "
+              f"({thought_orphans} thoughts had no matching position in train split)")
     else:
         print("SFT: no connect4_thoughts.jsonl found — using generic FILLER_THOUGHTS fallback")
-    formatted = []
-    missing = 0
-    for entry in data[:max_rows]:
-        system_msg, user_msg = build_prompt(entry["move_sequence"])
-        # Prefer teacher-generated reasoning for this exact board; fall back
-        # to a random filler line if the position isn't in the JSONL.
-        thought = thoughts.get(entry["move_sequence"])
-        if thought is None:
-            missing += 1
+        for entry in data[:max_rows]:
+            system_msg, user_msg = build_prompt(entry["move_sequence"])
             thought = rng.choice(FILLER_THOUGHTS)
-        best_col = entry["best_col"]
-        conv = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-            {"role": "assistant", "content": f"<think>{thought}</think>\n{best_col}"},
-        ]
-        formatted.append({
-            "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False),
-        })
-    if thoughts and missing:
-        print(f"SFT: {missing}/{len(formatted)} positions had no teacher trace — used filler fallback")
+            best_col = entry["best_col"]
+            conv = [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f"<think>{thought}</think>\n{best_col}"},
+            ]
+            formatted.append({
+                "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False),
+            })
     return Dataset.from_list(formatted)
 
 
