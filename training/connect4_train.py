@@ -215,14 +215,18 @@ def prepare_grpo_dataset(data, max_rows, tokenizer):
             {"role": "user", "content": user_msg},
         ]
         best_score = max(entry["scores"])
-        # DeepSeek-R1 / gpt-oss trick: prefix `<think>` to the prompt so the
-        # model's first generated token is guaranteed to be INSIDE a think
-        # block. Without this, base Gemma 4's strong prior P(digit|prompt)
-        # wins over SFT's weaker P(<think>|prompt) and the model skips
-        # thinking entirely. The model then only has to continue the think
-        # block and close it — which SFT teaches well under teacher forcing.
-        prompt_str = tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
-        prompt_str = prompt_str + "<think>"
+        # Use Gemma 4's native thinking format:
+        #   <|think|> in system prompt (auto-added by enable_thinking=True)
+        #   + <|channel>thought\n...<channel|>{answer} in the assistant turn
+        # Unlike literal `<think>` text, `<|channel>` (id 100) and `<channel|>`
+        # (id 101) are single special tokens that Gemma 4 has strong
+        # pretrained priors for. Prepending `<|channel>thought\n` forces the
+        # model's first generated token to be inside the thinking channel;
+        # SFT teaches it to produce reasoning then `<channel|>{digit}`.
+        prompt_str = tokenizer.apply_chat_template(
+            conv, tokenize=False, add_generation_prompt=True, enable_thinking=True
+        )
+        prompt_str = prompt_str + "<|channel>thought\n"
         formatted.append({
             "prompt": prompt_str,
             "move_sequence": entry["move_sequence"],
@@ -312,13 +316,17 @@ def prepare_sft_dataset(tokenizer):
         for row in thoughts:
             seq = row["move_sequence"]
             system_msg, user_msg = build_prompt(seq)
+            # Gemma 4 native thinking format: <|channel>thought\n...<channel|>
+            # <|channel> (id 100) and <channel|> (id 101) are single special
+            # tokens with strong pretrained priors, so SFT only has to nudge
+            # the model — not teach from scratch as it would for literal text.
             conv = [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": f"<think>{row['thought']}</think>\n{row['best_col']}"},
+                {"role": "assistant", "content": f"<|channel>thought\n{row['thought']}<channel|>{row['best_col']}"},
             ]
             formatted.append({
-                "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False),
+                "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False, enable_thinking=True),
             })
         print(f"SFT: built {len(formatted)} examples from teacher thoughts (zero CSV lookup)")
     else:
@@ -334,10 +342,10 @@ def prepare_sft_dataset(tokenizer):
             conv = [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": f"<think>{thought}</think>\n{best_col}"},
+                {"role": "assistant", "content": f"<|channel>thought\n{thought}<channel|>{best_col}"},
             ]
             formatted.append({
-                "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False),
+                "text": tokenizer.apply_chat_template(conv, tokenize=False, add_generation_prompt=False, enable_thinking=True),
             })
     return Dataset.from_list(formatted)
 
@@ -534,7 +542,7 @@ def run_sft(config, train_data):
         ),
     )
 
-    print("Starting SFT... Teaching the model to output <think>...</think> + digit")
+    print("Starting SFT... Teaching the model to output <|channel>thought\\n...<channel|> + digit")
     trainer.train()
     if use_wandb:
         wandb.finish()
@@ -574,7 +582,7 @@ def run_sft(config, train_data):
     # whole 8B base (OOM) or nothing at all. Plain model.eval() leaves the
     # adapter active during forward/generate; model.train() before returning
     # puts dropout back for GSPO.
-    print("\nVerifying format compliance on 20 samples (STRICT — must have <think>...</think> + digit)...")
+    print("\nVerifying format compliance on 20 samples (STRICT — must have <|channel>...<channel|> + digit)...")
     model.eval()
     correct = 0
     total = 20
@@ -734,10 +742,15 @@ class CurriculumCallback(TrainerCallback):
 # =============================================================================
 
 def strip_thinking(text):
-    """Remove <think>...</think> blocks from output. Also strips the
-    closing-only pattern `...</think>` at the start of the text, which
-    is what we get when the GRPO prompt has a prepended `<think>` so the
-    completion starts mid-think-block."""
+    """Remove Gemma 4 native thinking blocks from output.
+
+    Matches either the full `<|channel>...<channel|>` wrapper (spontaneous
+    case) or the closing-only `...<channel|>` at the start (when the GRPO
+    prompt prepended `<|channel>thought\\n` so the completion begins mid-
+    block). Also strips legacy `<think>...</think>` literal tags in case
+    any generations still emit them — defensive."""
+    text = re.sub(r'<\|channel>.*?<channel\|>', '', text, flags=re.DOTALL)
+    text = re.sub(r'^.*?<channel\|>', '', text, flags=re.DOTALL)
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     text = re.sub(r'^.*?</think>', '', text, flags=re.DOTALL)
     return text.strip()
@@ -762,25 +775,32 @@ def is_clean_output(text):
 
 
 def is_thinking_output(text):
-    """STRICT format check: must have <think>{non-trivial content}</think>
-    followed by a clean digit 0-6. Used by the SFT compliance check so
-    "20/20 passed" only counts completions that actually learned the
-    format — not ones that skipped the wrapper entirely. Accepts either
-    `<think>...</think>` (spontaneous) or `...</think>` (when the prompt
-    prefixed `<think>` and the completion starts mid-block)."""
-    m_full = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
-    m_close = re.match(r'^(.*?)</think>', text, re.DOTALL)
-    if m_full:
-        content = m_full.group(1).strip()
-        after = text[m_full.end():]
-    elif m_close:
-        content = m_close.group(1).strip()
-        after = text[m_close.end():]
-    else:
+    """STRICT format check: must have a Gemma 4 channel block with
+    non-trivial content followed by a clean digit 0-6. Used by the SFT
+    compliance check so "20/20 passed" only counts completions that
+    actually learned the format. Accepts either full `<|channel>...<channel|>`
+    (spontaneous) or closing-only `...<channel|>` (when the prompt
+    prepended `<|channel>thought\\n` and completion starts mid-block).
+    Also accepts legacy `<think>...</think>` literal tags, defensively."""
+    patterns = [
+        (r'<\|channel>(.*?)<channel\|>', re.search),
+        (r'^(.*?)<channel\|>', re.match),
+        (r'<think>(.*?)</think>', re.search),
+        (r'^(.*?)</think>', re.match),
+    ]
+    content = None
+    after_start = None
+    for pat, fn in patterns:
+        m = fn(pat, text, re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+            after_start = m.end()
+            break
+    if content is None or after_start is None:
         return False
     if len(content) < 5:
         return False
-    return after.strip() in {"0", "1", "2", "3", "4", "5", "6"}
+    return text[after_start:].strip() in {"0", "1", "2", "3", "4", "5", "6"}
 
 
 # =============================================================================
@@ -806,21 +826,27 @@ class RewardCalculator:
         return rewards
 
     def reward_thinking(self, completions, **kwargs):
-        """Reward a non-trivial think-block before the digit. Accepts both:
-           - `<think>...</think>` — full block, emitted spontaneously
-           - `...</think>`        — closing-only, emitted because the prompt
-                                    already prepended `<think>` for GRPO.
+        """Reward a non-trivial thinking block before the digit. Accepts:
+           - `<|channel>...<channel|>` — Gemma 4 native, spontaneous
+           - `...<channel|>`           — closing-only, when GRPO prompt
+                                         prepended `<|channel>thought\\n`
+           - `<think>...</think>` / `...</think>` — legacy literal tags
         Magnitude is ~1/10 of reward_move_quality so it nudges toward
         thinking without drowning out move-quality gradient."""
+        patterns = [
+            (r'<\|channel>(.*?)<channel\|>', re.search),
+            (r'^(.*?)<channel\|>', re.match),
+            (r'<think>(.*?)</think>', re.search),
+            (r'^(.*?)</think>', re.match),
+        ]
         rewards = []
         for c in completions:
-            m_full = re.search(r'<think>(.*?)</think>', c, re.DOTALL)
-            m_close = re.match(r'^(.*?)</think>', c, re.DOTALL)
             content = None
-            if m_full:
-                content = m_full.group(1).strip()
-            elif m_close:
-                content = m_close.group(1).strip()
+            for pat, fn in patterns:
+                m = fn(pat, c, re.DOTALL)
+                if m:
+                    content = m.group(1).strip()
+                    break
             if content is not None and len(content) >= 10:
                 rewards.append(1.0)      # substantive think block
             elif content is not None:
@@ -864,10 +890,10 @@ class RewardCalculator:
                 print(f"    {line}")
             print(f"  oracle scores: {[round(s, 2) for s in oracle_scores]}  best_col={best_col_oracle}")
             print(f"  best of {len(completions)} (idx={best_idx}, parsed_col={best_col_str}, reward={rewards[best_idx]:+.2f}):")
-            # Reconstruct the visible reasoning. The GRPO prompt has `<think>`
-            # prepended, so the completion starts mid-block — re-add the
-            # opening tag for readability.
-            visible = "<think>" + best_completion
+            # Reconstruct the visible reasoning. The GRPO prompt has
+            # `<|channel>thought\n` prepended, so the completion starts
+            # mid-block — re-add the opening tag for readability.
+            visible = "<|channel>thought\n" + best_completion
             for line in visible.splitlines():
                 print(f"    | {line}")
         return rewards
