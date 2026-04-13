@@ -124,10 +124,10 @@ def build_prompt(move_sequence):
 # =============================================================================
 
 MODEL_CONFIGS = {
-    "e2b-bf16": {"model_name": "unsloth/gemma-4-E2B-it", "load_in_4bit": False, "load_in_8bit": False, "lora_r": 16, "grpo_num_generations": 8, "grpo_batch_size": 8, "grpo_grad_accum": 1},
-    "e2b-8bit": {"model_name": "unsloth/gemma-4-E2B-it", "load_in_4bit": False, "load_in_8bit": True,  "lora_r": 16, "grpo_num_generations": 8, "grpo_batch_size": 8, "grpo_grad_accum": 1},
-    "e4b-bf16": {"model_name": "unsloth/gemma-4-E4B-it", "load_in_4bit": False, "load_in_8bit": False, "lora_r": 16, "grpo_num_generations": 6, "grpo_batch_size": 6, "grpo_grad_accum": 2},
-    "e4b-8bit": {"model_name": "unsloth/gemma-4-E4B-it", "load_in_4bit": False, "load_in_8bit": True,  "lora_r": 16, "grpo_num_generations": 8, "grpo_batch_size": 8, "grpo_grad_accum": 1},
+    "e2b-bf16": {"model_name": "unsloth/gemma-4-E2B-it", "load_in_4bit": False, "load_in_8bit": False, "lora_r": 16, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "e2b-8bit": {"model_name": "unsloth/gemma-4-E2B-it", "load_in_4bit": False, "load_in_8bit": True,  "lora_r": 16, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "e4b-bf16": {"model_name": "unsloth/gemma-4-E4B-it", "load_in_4bit": False, "load_in_8bit": False, "lora_r": 16, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
+    "e4b-8bit": {"model_name": "unsloth/gemma-4-E4B-it", "load_in_4bit": False, "load_in_8bit": True,  "lora_r": 16, "grpo_num_generations": 4, "grpo_batch_size": 4, "grpo_grad_accum": 2},
 }
 
 
@@ -822,41 +822,66 @@ class RewardCalculator:
         self._debug_every = debug_every
         self._reward_quality_calls = 0
 
+    def reward_closes_and_answers(self, completions, **kwargs):
+        """STRICT format reward. Largest magnitude so it dominates early
+        training — forces the model to converge on "close thinking,
+        then emit ONE clean digit" before chasing move quality.
+          +5.0  : completion has `<channel|>` and the text after it is
+                  exactly a digit 0-6 (optional whitespace/turn-end OK).
+          -10.0 : `<channel|>` present but the answer after it is malformed
+                  (e.g. "The answer is 3", "column 3", etc.).
+          -20.0 : `<channel|>` never appears — the model rambled past
+                  max_completion_length without closing its thinking."""
+        rewards = []
+        for c in completions:
+            if "<channel|>" not in c:
+                rewards.append(-20.0)
+                continue
+            after = c.split("<channel|>", 1)[1].strip()
+            # Strip common trailing Gemma 4 turn-end tokens that might survive decode
+            for tail in ("<turn|>", "<end_of_turn>", "<|end_of_turn|>"):
+                if after.endswith(tail):
+                    after = after[: -len(tail)].strip()
+            if after in {"0", "1", "2", "3", "4", "5", "6"}:
+                rewards.append(5.0)
+            else:
+                rewards.append(-10.0)
+        return rewards
+
     def reward_format(self, completions, **kwargs):
-        """Reward for outputting just a single digit 0-6."""
+        """Lenient format check: single digit 0-6 after stripping any
+        thinking block. Kept as a secondary signal alongside the much
+        stronger reward_closes_and_answers — differentiates 'produced
+        SOME parseable column' from 'produced total nonsense'."""
         rewards = []
         for c in completions:
             rewards.append(1.0 if is_clean_output(c) else -10.0)
         return rewards
 
-    def reward_thinking(self, completions, **kwargs):
-        """Reward a non-trivial thinking block before the digit. Accepts:
-           - `<|channel>...<channel|>` — Gemma 4 native, spontaneous
-           - `...<channel|>`           — closing-only, when GRPO prompt
-                                         prepended `<|channel>thought\\n`
-           - `<think>...</think>` / `...</think>` — legacy literal tags
-        Magnitude is ~1/10 of reward_move_quality so it nudges toward
-        thinking without drowning out move-quality gradient."""
-        patterns = [
-            (r'<\|channel>(.*?)<channel\|>', re.search),
-            (r'^(.*?)<channel\|>', re.match),
-            (r'<think>(.*?)</think>', re.search),
-            (r'^(.*?)</think>', re.match),
-        ]
+    def reward_conciseness(self, completions, move_sequence, **kwargs):
+        """Bonus for CORRECT answers reached with less thinking.
+        Only fires when the parsed column matches the oracle's best move,
+        so we never push wrong answers to get shorter. Among correct
+        answers: linear decay +3.0 at ≤200 chars → 0 at ≥1500 chars.
+        Encourages the model to reach the right conclusion quickly."""
         rewards = []
-        for c in completions:
-            content = None
-            for pat, fn in patterns:
-                m = fn(pat, c, re.DOTALL)
-                if m:
-                    content = m.group(1).strip()
-                    break
-            if content is not None and len(content) >= 10:
-                rewards.append(1.0)      # substantive think block
-            elif content is not None:
-                rewards.append(-0.5)     # tag present but near-empty
+        for c, seq in zip(completions, move_sequence):
+            col = extract_column_from_response(c)
+            if col is None:
+                rewards.append(0.0)
+                continue
+            scores = self.score_lookup.get(seq, [0.0] * 7)
+            best_oracle = max(range(7), key=lambda i: scores[i])
+            if col != best_oracle:
+                rewards.append(0.0)   # wrong answer — no bonus at all
+                continue
+            n = len(c)
+            if n <= 200:
+                rewards.append(3.0)
+            elif n >= 1500:
+                rewards.append(0.0)
             else:
-                rewards.append(-2.0)     # no think block at all
+                rewards.append(3.0 * (1500 - n) / 1300)
         return rewards
 
     def reward_move_quality(self, completions, move_sequence, max_reward=None, **kwargs):
@@ -970,7 +995,7 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     # eyeball whether max_completion_length / max_seq_length are well-sized.
     sample_prompts = [dataset[i]["prompt"] for i in range(min(5, len(dataset)))]
     sample_lens = [len(tokenizer(text=p, return_tensors="pt").input_ids[0]) for p in sample_prompts]
-    print(f"  prompt token lengths (first 5): {sample_lens}  max_completion_length=512  temperature=1.0")
+    print(f"  prompt token lengths (first 5): {sample_lens}  max_completion_length=1536  temperature=1.0")
     run_name = f"grpo-{config['model_size']}"
 
     # Gaussian curriculum
@@ -1004,7 +1029,7 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
         output_dir=config["grpo_output"],
         temperature=1.0,
         num_generations=config["grpo_num_generations"],
-        max_completion_length=512,
+        max_completion_length=1536,
         per_device_train_batch_size=config["grpo_batch_size"],
         gradient_accumulation_steps=config["grpo_grad_accum"],
         max_steps=config["grpo_max_steps"],
@@ -1039,10 +1064,13 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
+        # Ordering matters for gradient magnitude inspection in the logs,
+        # but GRPO sums all three anyway. Scales: closes_and_answers ∈
+        # {+5, -10, -20}, move_quality ∈ [-10, +10], conciseness ∈ [0, +3].
         reward_funcs=[
-            reward_calc.reward_format,
+            reward_calc.reward_closes_and_answers,
             reward_calc.reward_move_quality,
-            reward_calc.reward_thinking,
+            reward_calc.reward_conciseness,
         ],
         args=grpo_config,
         train_dataset=dataset,
@@ -1050,7 +1078,7 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     )
 
     print("\nStarting GSPO (Unsloth inference, sequence-level IS)...")
-    print(f"  loss_type={loss_type}  max_completion_length=512")
+    print(f"  loss_type={loss_type}  max_completion_length=1536")
     print(f"  Curriculum: level 0→9 (easy→hard), advances at {config.get('curriculum_threshold', 0.7):.0%} ratio")
     if hf_repo:
         print(f"  HF auto-push: every save to https://huggingface.co/{hf_repo} (private)")
@@ -1221,7 +1249,7 @@ def push_to_hub(config):
 def main():
     parser = argparse.ArgumentParser(description="Connect Four GSPO Training Pipeline (Gemma 4 + Unsloth)")
     parser.add_argument("--model", choices=["e2b-bf16", "e2b-8bit", "e4b-bf16", "e4b-8bit"], required=True)
-    parser.add_argument("--stage", choices=["sft", "grpo", "eval", "export", "push"], default="sft")
+    parser.add_argument("--stage", choices=["sft", "grpo", "eval", "export", "push"], default="grpo")
     parser.add_argument("--csv", default="connect4_data.csv")
     parser.add_argument("--hf-repo", default=None)
     parser.add_argument("--max-steps", type=int, default=None)
