@@ -961,31 +961,41 @@ def run_grpo(config, train_data, model=None, tokenizer=None):
     #    via Unsloth's FastLanguageModel(adapter_dir).
     # 3. --stage grpo with no SFT anywhere — cold start from base Gemma 4.
     if model is None or tokenizer is None:
+        use_sft_adapter = config.get("use_sft", False)
         sft_dir = config["grpo_output"] + "_sft"
         sft_adapter_config = os.path.join(sft_dir, "adapter_config.json")
-        # If local SFT is missing but --hf-repo is set, try to pull from
-        # <hf_repo>-sft (where run_sft pushes after training).
-        if not os.path.exists(sft_adapter_config) and config.get("hf_repo") and HF_AVAILABLE:
-            sft_repo = f"{config['hf_repo']}-sft"
-            try:
-                from huggingface_hub import snapshot_download
-                print(f"  No local SFT adapter — pulling from https://huggingface.co/{sft_repo}")
-                snapshot_download(repo_id=sft_repo, local_dir=sft_dir)
-            except Exception as e:
-                print(f"  Could not pull SFT adapter from {sft_repo}: {e}")
-        if os.path.exists(sft_adapter_config):
-            print(f"  Loading base + SFT LoRA adapter from {sft_dir} (resume path)")
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=sft_dir,
-                max_seq_length=config["max_seq_length"],
-                load_in_4bit=config.get("load_in_4bit", False),
-                load_in_8bit=config.get("load_in_8bit", False),
-                full_finetuning=False,
-            )
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
+
+        if use_sft_adapter:
+            # Explicit opt-in: look for local adapter, else pull from
+            # <hf_repo>-sft if HF is available. Fall through to cold start
+            # if neither works.
+            if not os.path.exists(sft_adapter_config) and config.get("hf_repo") and HF_AVAILABLE:
+                sft_repo = f"{config['hf_repo']}-sft"
+                try:
+                    from huggingface_hub import snapshot_download
+                    print(f"  --sft set, no local SFT adapter — pulling from https://huggingface.co/{sft_repo}")
+                    snapshot_download(repo_id=sft_repo, local_dir=sft_dir)
+                except Exception as e:
+                    print(f"  Could not pull SFT adapter from {sft_repo}: {e}")
+            if os.path.exists(sft_adapter_config):
+                print(f"  Loading base + SFT LoRA adapter from {sft_dir} (--sft resume path)")
+                model, tokenizer = FastLanguageModel.from_pretrained(
+                    model_name=sft_dir,
+                    max_seq_length=config["max_seq_length"],
+                    load_in_4bit=config.get("load_in_4bit", False),
+                    load_in_8bit=config.get("load_in_8bit", False),
+                    full_finetuning=False,
+                )
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+            else:
+                print("  --sft set but no adapter found locally or on HF — cold start from base Gemma 4.")
+                model, tokenizer = load_model_and_tokenizer(config)
+                model = apply_lora(model, config)
         else:
-            print("  No SFT adapter found — starting GSPO from base Gemma 4.")
+            # Default: cold start. Gemma 4's pretrained thinking mode is the
+            # format prior; GSPO rewards teach column selection. No SFT needed.
+            print("  --sft not set — cold start GSPO from base Gemma 4 (pass --sft to resume from SFT adapter).")
             model, tokenizer = load_model_and_tokenizer(config)
             model = apply_lora(model, config)
     else:
@@ -1269,6 +1279,13 @@ def main():
     parser.add_argument("--curriculum-threshold", type=float, default=0.7)
     parser.add_argument("--loss-type", default=None)
     parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument("--sft", action="store_true",
+        help="Use the SFT adapter as GSPO starting point. If a local adapter "
+             "exists at outputs_grpo_<variant>_sft/, load it. Else, if "
+             "--hf-repo is set, pull <hf_repo>-sft from HF. Default is to "
+             "cold-start GSPO from base Gemma 4 (Gemma's pretrained "
+             "thinking mode handles the format) — much cleaner than "
+             "inheriting a possibly-stale SFT adapter.")
     args = parser.parse_args()
 
     use_wandb = WANDB_AVAILABLE and not args.no_wandb
@@ -1277,6 +1294,7 @@ def main():
     config["hf_repo"] = args.hf_repo
     config["grpo_loss_type"] = args.loss_type
     config["curriculum_threshold"] = args.curriculum_threshold
+    config["use_sft"] = args.sft
     if args.max_steps:
         config["grpo_max_steps"] = args.max_steps
     config["use_wandb"] = use_wandb
