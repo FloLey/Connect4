@@ -477,6 +477,11 @@ def load_model_and_tokenizer(config, model_path=None):
         load_in_4bit=config.get("load_in_4bit", False),
         load_in_8bit=config.get("load_in_8bit", False),
         full_finetuning=False,
+        # vLLM 0.16-0.19 pin transformers<5, but Gemma 4 requires
+        # transformers>=5.5.0, so vLLM can't be used here. Per Unsloth's
+        # Gemma 4 RL docs, disable fast_inference and use Unsloth's native
+        # generation path. (vllm-project/vllm#39216)
+        fast_inference=False,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
