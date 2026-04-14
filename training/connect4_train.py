@@ -435,8 +435,42 @@ def _dump_first_example(text, label):
     print(f"--- end {label} example ---\n")
 
 
+def _force_batch_decode_keep_specials(tokenizer):
+    """Monkey-patch tokenizer.batch_decode to always pass
+    skip_special_tokens=False, regardless of what the caller requested.
+
+    Why: TRL's GRPOTrainer hardcodes `batch_decode(..., skip_special_tokens=True)`
+    when decoding rollouts for reward functions. That strips our format
+    markers (`<|channel>`, `<channel|>`, `<turn|>`) before our rewards see
+    them, forcing us into brittle trailing-digit heuristics. There's an
+    open TRL feature request for a config knob (huggingface/trl#2897,
+    #3026) but nothing has landed.
+
+    This wrapper intercepts the call at the tokenizer level, ignoring the
+    caller's kwarg. Simpler and more reliable than flipping AddedToken
+    .special attributes, which doesn't consistently round-trip through
+    the fast-tokenizer's Rust state (we tried that in add4611 — it
+    silently didn't work).
+
+    Side effects: ALL batch_decode calls on this tokenizer now keep
+    special tokens. In this codebase that's fine — our own decode paths
+    either pass skip_special_tokens=False explicitly (run_sft compliance
+    check, run_eval) or use tokenizer.decode (singular, not batch). And
+    our reward/parse functions handle text with special tokens correctly
+    via _strip_turn_tails + `<channel|>` splitting."""
+    _original = tokenizer.batch_decode
+    def _patched(*args, **kwargs):
+        kwargs["skip_special_tokens"] = False
+        return _original(*args, **kwargs)
+    tokenizer.batch_decode = _patched
+
+
 def load_model_and_tokenizer(config, model_path=None):
-    """Load model and tokenizer via Unsloth's FastLanguageModel (text-only)."""
+    """Load model and tokenizer via Unsloth's FastLanguageModel (text-only).
+
+    Applies the batch_decode monkey-patch so TRL's reward-function decode
+    path receives the real token stream (including `<channel|>`), making
+    our format rewards structural instead of heuristic."""
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_path or config["model_name"],
         max_seq_length=config["max_seq_length"],
@@ -446,6 +480,7 @@ def load_model_and_tokenizer(config, model_path=None):
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    _force_batch_decode_keep_specials(tokenizer)
     return model, tokenizer
 
 
@@ -746,31 +781,26 @@ class CurriculumCallback(TrainerCallback):
 
 
 # =============================================================================
-# OUTPUT PARSING (handles <think> blocks, expects single digit 0-6)
+# OUTPUT PARSING — structural on `<channel|>`, possible because we monkey-patch
+# tokenizer.batch_decode to always use skip_special_tokens=False (see
+# _force_batch_decode_keep_specials). All reward/parse functions receive
+# completions with `<channel|>` literally in the text.
 # =============================================================================
 
-# Match a single digit 0-6 at the end of a string, with optional trailing
-# whitespace/punctuation. This is what survives `skip_special_tokens=True`
-# decode of a completion that ended with `<channel|>{digit}<turn|>`: only
-# the digit (plus whatever came before the channel opener) remains visible.
-_TRAILING_DIGIT = re.compile(r'([0-6])\s*[.!?,;:\s]*$')
+_VALID_DIGITS = {"0", "1", "2", "3", "4", "5", "6"}
 
-# Trailing Gemma 4 (and related) special token strings we strip before
-# matching. If compliance/eval decode with skip_special_tokens=False these
-# tokens appear verbatim; if TRL rewards decode with =True they're gone.
-_SPECIAL_TAIL_TOKENS = (
-    "<turn|>", "<end_of_turn>", "<|end_of_turn|>", "<|endoftext|>",
-    "<channel|>", "<|channel>", "<|think|>",
-)
+# End-of-turn markers we want to strip from the tail of the answer portion so
+# `"3<turn|>"` (or `"3<end_of_turn>"`, etc.) still matches the bare digit.
+_TURN_END_TAILS = ("<turn|>", "<end_of_turn>", "<|end_of_turn|>", "<|endoftext|>")
 
 
-def _strip_trailing_specials(text):
-    """Remove trailing whitespace + any of _SPECIAL_TAIL_TOKENS (repeating)."""
+def _strip_turn_tails(text):
+    """Remove trailing whitespace + any `<turn|>`-family marker (repeating)."""
     out = text.rstrip()
     changed = True
     while changed:
         changed = False
-        for tok in _SPECIAL_TAIL_TOKENS:
+        for tok in _TURN_END_TAILS:
             if out.endswith(tok):
                 out = out[: -len(tok)].rstrip()
                 changed = True
@@ -778,51 +808,54 @@ def _strip_trailing_specials(text):
 
 
 def strip_thinking(text):
-    """Kept for backward compat; returns text unchanged.
-
-    Rationale: Gemma 4's `<|channel>...<channel|>` block uses special
-    tokens that TRL strips during reward decoding, so there's nothing
-    to strip at reward time. Parsing now relies on _TRAILING_DIGIT at
-    the end of the decoded text instead."""
-    return text.strip()
+    """Return only the post-`<channel|>` content with turn tails stripped.
+    If no `<channel|>` appears, returns the whole text stripped — which
+    is what we want for eval-stage parsing on a well-formed completion."""
+    if "<channel|>" in text:
+        return _strip_turn_tails(text.rsplit("<channel|>", 1)[1]).strip()
+    return _strip_turn_tails(text).strip()
 
 
 def extract_column_from_response(text):
-    """Extract the answer column (0-6) as the LAST digit in the text.
+    """Parse the answer column 0-6 from the text after `<channel|>`.
 
-    After decoding (with or without special tokens), the digit sits at
-    the tail. Strip any trailing special-token strings first so the
-    regex anchor-to-end works."""
-    cleaned = _strip_trailing_specials(text)
-    m = _TRAILING_DIGIT.search(cleaned)
-    if m:
-        return int(m.group(1))
-    return None
+    Correct format: `<|channel>thought\\n{reasoning}<channel|>{digit}<turn|>`.
+    We split on `<channel|>`, strip any trailing turn-end tokens, and
+    accept the remainder iff it's exactly one digit in 0-6."""
+    if "<channel|>" not in text:
+        return None
+    after = _strip_turn_tails(text.rsplit("<channel|>", 1)[1]).strip()
+    return int(after) if after in _VALID_DIGITS else None
 
 
 def is_clean_output(text):
-    """Check if the response ends with a single digit 0-6.
-
-    LENIENT: doesn't care about reasoning content length, just that a
-    digit is there at the end — used by reward_format (if registered)
-    and as a fallback digit-extractability check."""
+    """LENIENT format check: model closed `<channel|>` and the text
+    after it parses as a single digit 0-6. No requirement on reasoning
+    length — used by reward_format (if registered) and as a generic
+    "is the answer extractable" check."""
     return extract_column_from_response(text) is not None
 
 
 def is_thinking_output(text):
-    """STRICT format check: must end with a digit 0-6 AND have at least
-    some reasoning content before it. Used by the SFT compliance check.
-
-    We can't reliably see the `<channel|>` separator (stripped by TRL in
-    rewards; kept by compliance decode). Approximate: if the text before
-    the trailing digit has >= 5 chars of non-whitespace content, count
-    it as "thought then answered"."""
-    cleaned = _strip_trailing_specials(text)
-    m = _TRAILING_DIGIT.search(cleaned)
-    if not m:
+    """STRICT format check: `<channel|>` is present, text after is a
+    clean digit 0-6, AND the text BEFORE `<channel|>` has >= 5 chars of
+    reasoning content. Used by the SFT compliance check to reject "bare
+    digit with the closing tag but no actual thinking" outputs."""
+    if "<channel|>" not in text:
         return False
-    content_before = cleaned[:m.start()].strip()
-    return len(content_before) >= 5
+    before, _, after = text.partition("<channel|>")
+    # The prompt prefix `<|channel>thought\n` may also have survived decode
+    # (non-special or prepended by us). Strip it for the length check so
+    # "just the open tag" doesn't count as content.
+    before_stripped = before.lstrip()
+    for opener in ("<|channel>thought", "<|channel>", "<|think|>"):
+        if before_stripped.startswith(opener):
+            before_stripped = before_stripped[len(opener):].lstrip()
+            break
+    if len(before_stripped.strip()) < 5:
+        return False
+    answer = _strip_turn_tails(after).strip()
+    return answer in _VALID_DIGITS
 
 
 # =============================================================================
@@ -841,34 +874,25 @@ class RewardCalculator:
         self._reward_quality_calls = 0
 
     def reward_closes_and_answers(self, completions, **kwargs):
-        """STRICT format reward — scored on the POST-STRIP decoded text.
+        """STRICT format reward — STRUCTURAL check, not a heuristic.
 
-        TRL's GRPOTrainer decodes completions with skip_special_tokens=True
-        before passing them here, so `<channel|>` (id 101) is invisible by
-        the time this function runs. The model still learns to emit it at
-        inference (SFT taught that), but we grade on what remains: a
-        reasoning prefix followed by a trailing digit 0-6.
+        Possible because we monkey-patched tokenizer.batch_decode to force
+        skip_special_tokens=False — TRL hands us completions with the
+        real `<channel|>` marker still in the string.
 
-          +5.0  : completion ends in a valid digit and has >= 20 chars of
-                  reasoning before it (full teacher-style answer).
-          -5.0  : completion ends in a valid digit but only 5-19 chars of
-                  content before (minimal reasoning).
-          -10.0 : completion ends in a valid digit with <5 chars before
-                  (bare digit, no reasoning).
-          -20.0 : no trailing digit at all (model never committed)."""
+          +5.0  : `<channel|>` present AND text after it is exactly a
+                  single digit 0-6 (turn tails stripped).
+          -10.0 : `<channel|>` present but answer is prose ("column 3",
+                  "The answer is 3", "3 because ...").
+          -20.0 : no `<channel|>` at all (model never closed thinking)."""
         rewards = []
         for c in completions:
-            cleaned = _strip_trailing_specials(c)
-            m = _TRAILING_DIGIT.search(cleaned)
-            if not m:
+            if "<channel|>" not in c:
                 rewards.append(-20.0)
                 continue
-            content_before = cleaned[:m.start()].strip()
-            n = len(content_before)
-            if n >= 20:
+            after = _strip_turn_tails(c.rsplit("<channel|>", 1)[1]).strip()
+            if after in _VALID_DIGITS:
                 rewards.append(5.0)
-            elif n >= 5:
-                rewards.append(-5.0)
             else:
                 rewards.append(-10.0)
         return rewards
@@ -951,24 +975,11 @@ class RewardCalculator:
                 print(f"    {line}")
             print(f"  oracle scores: {[round(s, 2) for s in oracle_scores]}  best_col={best_col_oracle}")
             print(f"  best of {len(completions)} (idx={best_idx}, parsed_col={best_col_str}, reward={rewards[best_idx]:+.2f}):")
-            # Reconstruct the visible separators for readability. Both
-            # `<|channel>thought\n` (opener, was in the prompt prefix) and
-            # `<channel|>` (closer, was between reasoning and digit) are
-            # special tokens stripped by TRL during decode. We insert them
-            # back purely for display; the underlying text in the reward
-            # path is unaffected.
-            cleaned = _strip_trailing_specials(best_completion)
-            m = _TRAILING_DIGIT.search(cleaned)
-            if m is not None:
-                # Split the (possibly un-stripped) completion at the same
-                # offset the trailing-digit regex found in the cleaned text.
-                # The trailing specials are usually 0 chars post-strip, so
-                # indexing by `m.start()` into `best_completion` is safe.
-                split_at = m.start()
-                display = best_completion[:split_at].rstrip() + "<channel|>" + best_completion[split_at:]
-            else:
-                display = best_completion
-            visible = "<|channel>thought\n" + display
+            # `<channel|>` is in best_completion verbatim (batch_decode
+            # monkey-patch), no reconstruction needed. The `<|channel>thought\n`
+            # opener was in the PROMPT prefix, not the completion — prepend
+            # for context so the reader sees the full thinking block.
+            visible = "<|channel>thought\n" + best_completion
             for line in visible.splitlines():
                 print(f"    | {line}")
         return rewards
