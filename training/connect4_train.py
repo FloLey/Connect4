@@ -188,7 +188,19 @@ def parse_answer(completion):
     return int(matches[-1]) if matches else None
 
 
+# Module-level ring buffer of recent completions. Populated by
+# reward_format (which TRL calls every generation batch) so the
+# ThinkingLogger callback can surface them to wandb without reaching
+# into TRL internals. Holds up to RING_SIZE most-recent completion
+# strings.
+_RING_SIZE = 32
+_RECENT_COMPLETIONS = []
+
+
 def reward_format(completion, **kwargs):
+    _RECENT_COMPLETIONS.append(str(completion)[:4096])
+    if len(_RECENT_COMPLETIONS) > _RING_SIZE:
+        del _RECENT_COMPLETIONS[:-_RING_SIZE]
     return 5.0 if parse_answer(completion) is not None else -10.0
 
 
@@ -198,6 +210,45 @@ def reward_move_quality(completion, scores, valid_cols, **kwargs):
         return -10.0
     max_abs = max(abs(s) for s in scores) or 1.0
     return 10.0 * (scores[col] / max_abs)
+
+
+# ============================================================================
+# Thinking logger — surfaces raw completions (with any native-thinking
+# delimiters visible as plain text) to wandb every N training steps.
+# Reads from the _RECENT_COMPLETIONS ring buffer populated by
+# reward_format, so it does not depend on TRL's private attributes.
+# ============================================================================
+class ThinkingLogger:
+    def __init__(self, log_every=25):
+        self.log_every = log_every
+
+    def _log(self, step):
+        try:
+            import wandb
+        except ImportError:
+            return
+        if not _RECENT_COMPLETIONS:
+            return
+        sample = _RECENT_COMPLETIONS[-1]
+        parsed = parse_answer(sample)
+        wandb.log({
+            "sample/completion": wandb.Html(f"<pre>{sample[:2000]}</pre>"),
+            "sample/parsed_answer": parsed if parsed is not None else -1,
+            "sample/length_chars": len(sample),
+        }, step=step)
+
+    def as_callback(self):
+        from transformers import TrainerCallback
+
+        logger = self
+
+        class _CB(TrainerCallback):
+            def on_log(self, args, state, control, logs=None, **kwargs):
+                if state.global_step % logger.log_every != 0:
+                    return
+                logger._log(state.global_step)
+
+        return _CB()
 
 
 def build_prompt(tokenizer, entry):
