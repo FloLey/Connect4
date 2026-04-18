@@ -109,6 +109,39 @@ def split_data(raw, seed=42):
     train_sorted = sorted(train_data, key=difficulty_score, reverse=True)
     return train_sorted, eval_data
 
+
+# ============================================================================
+# Model + LoRA — Unsloth Gemma-4 RL recipe (no vLLM).
+# ============================================================================
+def load_model_and_tokenizer(config, adapter_path=None):
+    from unsloth import FastLanguageModel
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=config["model_name"],
+        load_in_8bit=config.get("load_in_8bit", False),
+        load_in_4bit=config.get("load_in_4bit", False),
+        max_seq_length=config["max_seq_length"],
+        full_finetuning=False,
+        fast_inference=False,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return model, tokenizer
+
+
+def apply_lora(model, config):
+    from unsloth import FastLanguageModel
+    return FastLanguageModel.get_peft_model(
+        model,
+        r=config["lora_r"],
+        lora_alpha=config["lora_alpha"],
+        lora_dropout=0,
+        bias="none",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
+        use_gradient_checkpointing="unsloth",
+        random_state=3407,
+    )
+
 MODEL_CONFIGS = {
     "e4b-8bit": {
         "model_name": "unsloth/gemma-4-E4B-it",
@@ -171,6 +204,16 @@ def main():
 
     print(f"=== Connect4 {args.model} / {args.stage} ===")
     print(json.dumps({k: v for k, v in config.items() if "dir" not in k}, indent=2))
+
+    if args.stage == "test-load":
+        model, tok = load_model_and_tokenizer(config)
+        model = apply_lora(model, config)
+        model.print_trainable_parameters()
+        hcfg = model.base_model.model.config
+        print(f"\nnum_hidden_layers: {hcfg.num_hidden_layers}")
+        print(f"vocab_size: {hcfg.vocab_size}")
+        print(f"pad/eos: {tok.pad_token_id}/{tok.eos_token_id}")
+        return
 
     if args.stage == "test-data":
         raw = load_csv_data(args.csv)
