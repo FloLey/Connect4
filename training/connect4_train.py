@@ -13,8 +13,10 @@ import json
 import os
 import random
 
-# unsloth must be imported before transformers — injects Gemma-4 RL patches.
-import unsloth  # noqa: F401
+# Per Unsloth docs, unsloth must be imported BEFORE transformers/trl. We
+# defer that import into the stages that touch the model (load/sft/grpo/
+# eval/export) so data-only stages (test-data, test-rewards,
+# test-curriculum) run without the torch+unsloth bootstrap.
 
 ROWS = 6
 COLS = 7
@@ -142,6 +144,58 @@ def apply_lora(model, config):
         random_state=3407,
     )
 
+
+# ============================================================================
+# Prompt — production-verbatim system+user templates from
+# backend/app/engine/ai.py:28-47, with the final "Output valid JSON."
+# line replaced by a bare-digit instruction.
+# ============================================================================
+SYSTEM_TEMPLATE = """
+You are an expert Connect Four player engine.
+You are Player {player_id} (Symbol: {symbol}).
+Opponent is Player {opponent_id} (Symbol: {opp_symbol}).
+Board: 6 Rows x 7 Columns.
+Goal: Connect 4 pieces in a row (Horizontal, Vertical, Diagonal).
+Gravity: Pieces fall to the lowest empty slot.
+"""
+
+USER_TEMPLATE = """
+Board (Visual):
+{visual_board}
+
+Board (Textual):
+{textual_board}
+
+Valid Columns: {valid_moves}
+
+Analyze the board state carefully. Output only a single digit 0-6.
+"""
+
+
+def build_prompt(tokenizer, entry):
+    seq = entry["move_sequence"]
+    g = reconstruct_board(seq)
+    pid, sym = current_player_of(seq)
+    opp_id = 2 if pid == 1 else 1
+    opp_sym = "O" if sym == "X" else "X"
+
+    system = SYSTEM_TEMPLATE.format(
+        player_id=pid, symbol=sym,
+        opponent_id=opp_id, opp_symbol=opp_sym,
+    )
+    user = USER_TEMPLATE.format(
+        visual_board=g.get_visual_board(),
+        textual_board=g.get_textual_description(),
+        valid_moves=g.get_valid_moves(),
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+
 MODEL_CONFIGS = {
     "e4b-8bit": {
         "model_name": "unsloth/gemma-4-E4B-it",
@@ -204,6 +258,16 @@ def main():
 
     print(f"=== Connect4 {args.model} / {args.stage} ===")
     print(json.dumps({k: v for k, v in config.items() if "dir" not in k}, indent=2))
+
+    if args.stage == "test-prompt":
+        raw = load_csv_data(args.csv)
+        train, _ = split_data(raw)
+        _, tok = load_model_and_tokenizer(config)
+        p = build_prompt(tok, train[0])
+        print("=== PROMPT ===")
+        print(p)
+        print(f"\ntokens: {len(tok(p).input_ids)}")
+        return
 
     if args.stage == "test-load":
         model, tok = load_model_and_tokenizer(config)
