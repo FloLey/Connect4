@@ -289,6 +289,35 @@ class ThinkingLogger:
         return _CB()
 
 
+# ============================================================================
+# Format probe — generate greedy completions on held-out positions and
+# count how many parse to a single digit 0-6. Used as the SFT early-stop
+# gate.
+# ============================================================================
+def probe_format(model, tokenizer, eval_data, n=50):
+    from unsloth import FastLanguageModel
+    import torch
+
+    FastLanguageModel.for_inference(model)
+    ok = 0
+    try:
+        for entry in eval_data[:n]:
+            p = build_prompt(tokenizer, entry)
+            inp = tokenizer(p, return_tensors="pt").to("cuda")
+            with torch.no_grad():
+                out = model.generate(
+                    **inp, max_new_tokens=512, do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            comp = tokenizer.decode(out[0][inp.input_ids.shape[1]:],
+                                    skip_special_tokens=True)
+            if parse_answer(comp) is not None:
+                ok += 1
+    finally:
+        FastLanguageModel.for_training(model)
+    return ok / max(n, 1)
+
+
 def build_prompt(tokenizer, entry):
     seq = entry["move_sequence"]
     g = reconstruct_board(seq)
@@ -353,6 +382,84 @@ def get_config(variant):
     cfg["sft_output_dir"] = f"outputs_sft_{variant}"
     cfg["final_model_dir"] = f"connect4-agent-{variant}"
     return cfg
+
+
+# ============================================================================
+# SFT — minimal digit-only warmup.
+# ============================================================================
+def run_sft(config, train_sorted, eval_data, model, tokenizer, hf_repo=None):
+    from datasets import Dataset
+    from transformers import TrainerCallback
+    from trl import SFTConfig, SFTTrainer
+
+    rows = []
+    for entry in train_sorted[:config["sft_examples"]]:
+        rows.append({
+            "prompt": build_prompt(tokenizer, entry),
+            "completion": str(entry["best_col"]),
+        })
+    ds = Dataset.from_list(rows)
+    print(f"SFT dataset: {len(ds)} examples (target = single digit)")
+
+    class ProbeEarlyStop(TrainerCallback):
+        def __init__(self, every=10, n=50, threshold=0.90):
+            self.every = every
+            self.n = n
+            self.threshold = threshold
+            self.best = 0.0
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step == 0 or state.global_step % self.every != 0:
+                return
+            rate = probe_format(model, tokenizer, eval_data, n=self.n)
+            self.best = max(self.best, rate)
+            print(f"  [probe step={state.global_step}] compliance={rate:.0%}")
+            if rate >= self.threshold:
+                print(f"  [probe] gate passed, early-stopping SFT")
+                control.should_training_stop = True
+
+    use_wandb = os.environ.get("WANDB_DISABLED", "").lower() != "true"
+    sft_args = SFTConfig(
+        output_dir=config["sft_output_dir"],
+        per_device_train_batch_size=config["sft_batch_size"],
+        gradient_accumulation_steps=config["sft_grad_accum"],
+        learning_rate=config["sft_lr"],
+        max_steps=config["sft_max_steps"],
+        warmup_steps=2,
+        lr_scheduler_type="constant",
+        logging_steps=1,
+        save_strategy="no",
+        report_to=["wandb"] if use_wandb else "none",
+        run_name=f"sft-{config['variant']}",
+        bf16=True,
+        completion_only_loss=True,
+        max_length=config["max_seq_length"],
+    )
+
+    probe_cb = ProbeEarlyStop(every=10, n=50, threshold=0.90)
+    trainer = SFTTrainer(
+        model=model,
+        args=sft_args,
+        train_dataset=ds,
+        processing_class=tokenizer,
+        callbacks=[probe_cb],
+    )
+    trainer.train()
+
+    sft_dir = config["sft_output_dir"]
+    trainer.save_model(sft_dir)
+    tokenizer.save_pretrained(sft_dir)
+    print(f"SFT adapter saved to {sft_dir}")
+
+    if hf_repo:
+        sft_repo = f"{hf_repo}-sft"
+        print(f"Pushing SFT adapter to https://huggingface.co/{sft_repo}")
+        model.push_to_hub(sft_repo, private=True)
+        tokenizer.push_to_hub(sft_repo, private=True)
+
+    final_rate = probe_format(model, tokenizer, eval_data, n=50)
+    print(f"final format compliance: {final_rate:.0%}")
+    return final_rate
 
 
 def main():
@@ -479,10 +586,21 @@ def main():
         print(f"\nValid cols: {g.get_valid_moves()}")
         return
 
+    if args.stage == "sft":
+        raw = load_csv_data(args.csv)
+        train, eval_ = split_data(raw)
+        model, tok = load_model_and_tokenizer(config)
+        model = apply_lora(model, config)
+        rate = run_sft(config, train, eval_, model, tok, hf_repo=args.hf_repo)
+        if rate >= 0.80:
+            print("\n>>> format gate passed — chaining to GSPO\n")
+            raise NotImplementedError("M11-13: run_grpo chain")
+        else:
+            print(f"\n>>> format gate failed ({rate:.0%} < 80%) — extend SFT or revisit prompt")
+        return
+
     if args.stage == "grpo":
         raise NotImplementedError("M11-13")
-    elif args.stage == "sft":
-        raise NotImplementedError("M10")
     elif args.stage == "eval":
         raise NotImplementedError("M15")
     elif args.stage == "export":
