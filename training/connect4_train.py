@@ -667,6 +667,55 @@ def run_eval(config, eval_data, model, tokenizer):
     print(f"wrote {out_path}")
 
 
+# ============================================================================
+# Export — merge the GSPO LoRA into the base weights and produce a GGUF.
+# ============================================================================
+def run_export(config):
+    from peft import PeftModel
+    model, tokenizer = load_model_and_tokenizer(config)
+    ckpt = config["output_dir"]
+    if not os.path.isdir(ckpt):
+        raise FileNotFoundError(f"No GSPO adapter at {ckpt}")
+    model = PeftModel.from_pretrained(model, ckpt)
+    merged_dir = config["final_model_dir"]
+    merged = model.merge_and_unload()
+    merged.save_pretrained(merged_dir)
+    tokenizer.save_pretrained(merged_dir)
+    print(f"Merged 16-bit model -> {merged_dir}")
+
+    gguf_dir = merged_dir + "-gguf"
+    try:
+        merged.save_pretrained_gguf(gguf_dir, tokenizer,
+                                    quantization_method="q4_k_m")
+        print(f"GGUF (q4_k_m) -> {gguf_dir}")
+    except Exception as e:
+        print(f"WARNING: GGUF export failed ({e}); merged weights still saved")
+
+
+def run_push(config, hf_repo):
+    from huggingface_hub import HfApi, create_repo
+    if not hf_repo:
+        raise ValueError("--hf-repo is required for push stage")
+    api = HfApi()
+    merged_dir = config["final_model_dir"]
+    gguf_dir = merged_dir + "-gguf"
+    if os.path.isdir(merged_dir):
+        create_repo(hf_repo, exist_ok=True, private=True)
+        api.upload_folder(folder_path=merged_dir, repo_id=hf_repo,
+                          commit_message=f"merged {config['variant']}")
+        print(f"-> https://huggingface.co/{hf_repo}")
+    else:
+        print(f"skip merged: {merged_dir}/ not found (run --stage export first)")
+    if os.path.isdir(gguf_dir):
+        gguf_repo = f"{hf_repo}-GGUF"
+        create_repo(gguf_repo, exist_ok=True, private=True)
+        api.upload_folder(folder_path=gguf_dir, repo_id=gguf_repo,
+                          commit_message=f"gguf {config['variant']}")
+        print(f"-> https://huggingface.co/{gguf_repo}")
+    else:
+        print(f"skip gguf: {gguf_dir}/ not found")
+
+
 def _load_sft_adapter(model, hf_repo):
     """Pull SFT adapter from HF and load it onto the current model."""
     from huggingface_hub import snapshot_download
@@ -844,9 +893,11 @@ def main():
         return
 
     if args.stage == "export":
-        raise NotImplementedError("M16")
+        run_export(config)
+        return
     if args.stage == "push":
-        raise NotImplementedError("M16")
+        run_push(config, args.hf_repo)
+        return
     raise NotImplementedError(args.stage)
 
 
