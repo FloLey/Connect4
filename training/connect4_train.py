@@ -583,6 +583,90 @@ def run_grpo(config, train_sorted, eval_data, model, tokenizer, hf_repo=None, ma
     print(f"GSPO adapter saved to {config['output_dir']}")
 
 
+# ============================================================================
+# Eval — greedy decode on the 10k held-out positions.
+# ============================================================================
+def run_eval(config, eval_data, model, tokenizer):
+    from unsloth import FastLanguageModel
+    import torch
+
+    FastLanguageModel.for_inference(model)
+
+    agg = {
+        "n": 0, "valid": 0, "exact": 0, "top2": 0,
+        "score_sum": 0.0,
+        "phase": {
+            "opening (0-8)": {"n": 0, "exact": 0, "top2": 0, "score_sum": 0.0},
+            "midgame (9-20)": {"n": 0, "exact": 0, "top2": 0, "score_sum": 0.0},
+            "endgame (21+)": {"n": 0, "exact": 0, "top2": 0, "score_sum": 0.0},
+        },
+    }
+
+    for i, entry in enumerate(eval_data):
+        if i and i % 1000 == 0:
+            rate = agg["exact"] / max(agg["valid"], 1)
+            print(f"  ...{i}/{len(eval_data)}  exact={rate:.1%}")
+        p = build_prompt(tokenizer, entry)
+        inp = tokenizer(p, return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            out = model.generate(
+                **inp, max_new_tokens=1024, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        comp = tokenizer.decode(out[0][inp.input_ids.shape[1]:],
+                                skip_special_tokens=True)
+        col = parse_answer(comp)
+
+        scores = entry["scores"]
+        best = entry["best_col"]
+        top2 = set(sorted(range(7), key=lambda c: -scores[c])[:2])
+        nmoves = len(entry["move_sequence"])
+        phase = ("opening (0-8)" if nmoves <= 8 else
+                 "midgame (9-20)" if nmoves <= 20 else "endgame (21+)")
+
+        agg["n"] += 1
+        agg["phase"][phase]["n"] += 1
+        if col is None or not (0 <= col < 7):
+            continue
+        agg["valid"] += 1
+        agg["score_sum"] += scores[col]
+        agg["phase"][phase]["score_sum"] += scores[col]
+        if col == best:
+            agg["exact"] += 1
+            agg["phase"][phase]["exact"] += 1
+        if col in top2:
+            agg["top2"] += 1
+            agg["phase"][phase]["top2"] += 1
+
+    n = agg["n"]
+    v = max(agg["valid"], 1)
+    print(f"\n=== EVAL {config['variant']} on n={n} ===")
+    print(f"  valid          : {agg['valid']/n:.1%}")
+    print(f"  exact (of valid): {agg['exact']/v:.1%}")
+    print(f"  top-2 (of valid): {agg['top2']/v:.1%}")
+    print(f"  mean oracle    : {agg['score_sum']/v:+.3f}")
+    for ph, s in agg["phase"].items():
+        if s["n"] == 0:
+            continue
+        vv = max(s["n"], 1)
+        print(f"    {ph:18}: exact={s['exact']/vv:.1%} top2={s['top2']/vv:.1%} "
+              f"score={s['score_sum']/vv:+.3f} (n={s['n']})")
+
+    out_path = f"eval_results_{config['variant']}.json"
+    with open(out_path, "w") as f:
+        json.dump({
+            "variant": config["variant"],
+            "model": config["model_name"],
+            "n": n,
+            "valid_pct": round(100 * agg["valid"] / n, 2),
+            "exact_pct": round(100 * agg["exact"] / v, 2),
+            "top2_pct": round(100 * agg["top2"] / v, 2),
+            "mean_oracle": round(agg["score_sum"] / v, 4),
+            "phase": agg["phase"],
+        }, f, indent=2)
+    print(f"wrote {out_path}")
+
+
 def _load_sft_adapter(model, hf_repo):
     """Pull SFT adapter from HF and load it onto the current model."""
     from huggingface_hub import snapshot_download
@@ -746,7 +830,19 @@ def main():
         return
 
     if args.stage == "eval":
-        raise NotImplementedError("M15")
+        from peft import PeftModel
+        raw = load_csv_data(args.csv)
+        _, eval_ = split_data(raw)
+        model, tok = load_model_and_tokenizer(config)
+        ckpt = config["output_dir"]
+        if os.path.isdir(ckpt):
+            print(f"Loading GSPO adapter from {ckpt}")
+            model = PeftModel.from_pretrained(model, ckpt)
+        else:
+            print(f"No adapter at {ckpt} — evaluating base model")
+        run_eval(config, eval_, model, tok)
+        return
+
     if args.stage == "export":
         raise NotImplementedError("M16")
     if args.stage == "push":
