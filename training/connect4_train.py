@@ -462,6 +462,138 @@ def run_sft(config, train_sorted, eval_data, model, tokenizer, hf_repo=None):
     return final_rate
 
 
+# ============================================================================
+# GSPO — sequence-level RL with curriculum sampling.
+# ============================================================================
+def run_grpo(config, train_sorted, eval_data, model, tokenizer, hf_repo=None, max_steps=None):
+    from datasets import IterableDataset
+    from trl import GRPOConfig, GRPOTrainer
+
+    n_steps = max_steps or config["grpo_max_steps"]
+    sampler = GaussianCurriculumSampler(n_items=len(train_sorted))
+    # Prime the column-score max so advance_threshold (max_reward * 0.7)
+    # matches reward_format(+5) + reward_move_quality(up to +10) = +15.
+    sampler.advance_threshold = 15.0 * 0.7
+
+    def _gen():
+        # Emit enough items for the whole run with slack.
+        n_items = n_steps * config["grpo_batch_size"] * config["grpo_grad_accum"] * 4
+        for _ in range(n_items):
+            idx, bucket = sampler.sample()
+            entry = train_sorted[idx]
+            g = reconstruct_board(entry["move_sequence"])
+            yield {
+                "prompt": build_prompt(tokenizer, entry),
+                "scores": entry["scores"],
+                "valid_cols": g.get_valid_moves(),
+                "bucket": bucket,
+            }
+
+    ds = IterableDataset.from_generator(_gen)
+
+    def rf_format(completions, **kwargs):
+        return [reward_format(c) for c in completions]
+
+    def rf_quality(completions, scores, valid_cols, bucket, **kwargs):
+        rewards = []
+        for c, s, v, b in zip(completions, scores, valid_cols, bucket):
+            r = reward_move_quality(c, s, v)
+            rewards.append(r)
+            # Pair with a format-reward estimate so curriculum
+            # EMA reflects the full reward budget.
+            sampler.update(b, r + reward_format(c))
+        return rewards
+
+    use_wandb = os.environ.get("WANDB_DISABLED", "").lower() != "true"
+
+    grpo_kwargs = dict(
+        output_dir=config["output_dir"],
+        per_device_train_batch_size=config["grpo_batch_size"],
+        gradient_accumulation_steps=config["grpo_grad_accum"],
+        num_generations=config["grpo_num_generations"],
+        temperature=config["grpo_temperature"],
+        max_completion_length=config["grpo_max_completion_length"],
+        max_prompt_length=config["grpo_max_prompt_length"],
+        learning_rate=config["grpo_lr"],
+        loss_type=config["grpo_loss_type"],
+        beta=config["grpo_beta"],
+        epsilon=config["grpo_epsilon"],
+        epsilon_high=config["grpo_epsilon_high"],
+        importance_sampling_level="sequence",
+        max_steps=n_steps,
+        save_steps=config["grpo_save_steps"],
+        save_strategy="steps",
+        warmup_steps=10,
+        lr_scheduler_type="constant",
+        logging_steps=1,
+        report_to=["wandb"] if use_wandb else "none",
+        run_name=f"grpo-{config['variant']}",
+        bf16=True,
+        use_vllm=False,
+        log_completions=True,
+        optim="adamw_8bit",
+        max_grad_norm=0.1,
+    )
+    if hf_repo:
+        grpo_kwargs.update(
+            push_to_hub=True,
+            hub_model_id=hf_repo,
+            hub_strategy="every_save",
+            hub_private_repo=True,
+        )
+    grpo_args = GRPOConfig(**grpo_kwargs)
+
+    thinking_cb = ThinkingLogger(log_every=25).as_callback()
+
+    class CurriculumMetrics:
+        """Push curriculum level + per-bucket EMA to wandb every log step."""
+        def __init__(self, sampler):
+            self.sampler = sampler
+
+        def as_callback(self):
+            from transformers import TrainerCallback
+            outer = self
+
+            class _CB(TrainerCallback):
+                def on_log(self, args, state, control, logs=None, **kw):
+                    if logs is None:
+                        return
+                    logs["curriculum/level"] = outer.sampler.center
+                    for i, ema in enumerate(outer.sampler.bucket_reward_ema):
+                        logs[f"curriculum/bucket_{i}_ema"] = ema
+
+            return _CB()
+
+    trainer = GRPOTrainer(
+        model=model,
+        args=grpo_args,
+        train_dataset=ds,
+        processing_class=tokenizer,
+        reward_funcs=[rf_format, rf_quality],
+        callbacks=[thinking_cb, CurriculumMetrics(sampler).as_callback()],
+    )
+
+    print(f"\nStarting GSPO: max_steps={n_steps}, K={config['grpo_num_generations']}, "
+          f"loss={config['grpo_loss_type']}, curriculum advance_threshold={sampler.advance_threshold:.1f}")
+    if hf_repo:
+        print(f"HF auto-push every {config['grpo_save_steps']} steps -> https://huggingface.co/{hf_repo}")
+    trainer.train()
+    model.save_pretrained(config["output_dir"])
+    tokenizer.save_pretrained(config["output_dir"])
+    print(f"GSPO adapter saved to {config['output_dir']}")
+
+
+def _load_sft_adapter(model, hf_repo):
+    """Pull SFT adapter from HF and load it onto the current model."""
+    from huggingface_hub import snapshot_download
+    sft_repo = f"{hf_repo}-sft"
+    local = f"outputs_sft_{hf_repo.split('/')[-1]}"
+    if not os.path.isdir(local):
+        snapshot_download(repo_id=sft_repo, local_dir=local)
+    model.load_adapter(local, adapter_name="default")
+    print(f"Loaded SFT adapter from {sft_repo}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", choices=list(MODEL_CONFIGS), required=True)
@@ -594,21 +726,32 @@ def main():
         rate = run_sft(config, train, eval_, model, tok, hf_repo=args.hf_repo)
         if rate >= 0.80:
             print("\n>>> format gate passed — chaining to GSPO\n")
-            raise NotImplementedError("M11-13: run_grpo chain")
+            run_grpo(config, train, eval_, model, tok,
+                     hf_repo=args.hf_repo,
+                     max_steps=int(os.environ.get("MAX_STEPS", "0")) or None)
         else:
             print(f"\n>>> format gate failed ({rate:.0%} < 80%) — extend SFT or revisit prompt")
         return
 
     if args.stage == "grpo":
-        raise NotImplementedError("M11-13")
-    elif args.stage == "eval":
+        raw = load_csv_data(args.csv)
+        train, eval_ = split_data(raw)
+        model, tok = load_model_and_tokenizer(config)
+        model = apply_lora(model, config)
+        if args.sft and args.hf_repo:
+            _load_sft_adapter(model, args.hf_repo)
+        run_grpo(config, train, eval_, model, tok,
+                 hf_repo=args.hf_repo,
+                 max_steps=int(os.environ.get("MAX_STEPS", "0")) or None)
+        return
+
+    if args.stage == "eval":
         raise NotImplementedError("M15")
-    elif args.stage == "export":
+    if args.stage == "export":
         raise NotImplementedError("M16")
-    elif args.stage == "push":
+    if args.stage == "push":
         raise NotImplementedError("M16")
-    else:
-        raise NotImplementedError(args.stage)
+    raise NotImplementedError(args.stage)
 
 
 if __name__ == "__main__":
