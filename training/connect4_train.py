@@ -213,6 +213,44 @@ def reward_move_quality(completion, scores, valid_cols, **kwargs):
 
 
 # ============================================================================
+# Curriculum — Gaussian over difficulty buckets. Easy positions (high
+# std-dev of column scores, i.e. sharp-best) are bucket 0; hard
+# positions (flat scores, i.e. many near-equal moves) are bucket 9.
+# The sampler draws from a Gaussian centered on the current difficulty
+# level and advances when the EMA reward for the current center bucket
+# crosses advance_threshold.
+# ============================================================================
+class GaussianCurriculumSampler:
+    def __init__(self, n_items, num_buckets=10, sigma=1.5,
+                 max_reward=15.0, advance_ratio=0.7, ema_alpha=0.1, seed=42):
+        self.n_items = n_items
+        self.num_buckets = num_buckets
+        self.sigma = sigma
+        self.center = 0.0
+        self.advance_threshold = max_reward * advance_ratio
+        self.ema_alpha = ema_alpha
+        self.bucket_reward_ema = [0.0] * num_buckets
+        self.rng = random.Random(seed)
+
+    def sample(self):
+        b = round(self.rng.gauss(self.center, self.sigma))
+        b = max(0, min(self.num_buckets - 1, b))
+        per = self.n_items // self.num_buckets
+        lo = b * per
+        hi = (b + 1) * per if b < self.num_buckets - 1 else self.n_items
+        return self.rng.randrange(lo, hi), b
+
+    def update(self, bucket, reward):
+        a = self.ema_alpha
+        self.bucket_reward_ema[bucket] = (1 - a) * self.bucket_reward_ema[bucket] + a * reward
+        cur = round(self.center)
+        if cur < self.num_buckets - 1 and self.bucket_reward_ema[cur] >= self.advance_threshold:
+            self.center = min(self.center + 1.0, self.num_buckets - 1)
+            return True
+        return False
+
+
+# ============================================================================
 # Thinking logger — surfaces raw completions (with any native-thinking
 # delimiters visible as plain text) to wandb every N training steps.
 # Reads from the _RECENT_COMPLETIONS ring buffer populated by
@@ -337,6 +375,25 @@ def main():
 
     print(f"=== Connect4 {args.model} / {args.stage} ===")
     print(json.dumps({k: v for k, v in config.items() if "dir" not in k}, indent=2))
+
+    if args.stage == "test-curriculum":
+        # Always-high reward → center should walk to the top bucket.
+        s = GaussianCurriculumSampler(n_items=10000)
+        advances = 0
+        for _ in range(2000):
+            _, b = s.sample()
+            if s.update(b, 12.0):
+                advances += 1
+        print(f"after 2000 high-reward samples:")
+        print(f"  center={s.center}  advances={advances}")
+        print(f"  bucket EMAs: {[f'{x:.2f}' for x in s.bucket_reward_ema]}")
+        # Low reward → no advance.
+        s2 = GaussianCurriculumSampler(n_items=10000)
+        for _ in range(500):
+            _, b = s2.sample()
+            s2.update(b, 2.0)
+        print(f"after 500 low-reward samples: center={s2.center}")
+        return
 
     if args.stage == "test-rewards":
         cases = [
