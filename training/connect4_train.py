@@ -10,8 +10,10 @@ Usage:
 import argparse
 import csv
 import json
+import math
 import os
 import random
+import re
 
 # Per Unsloth docs, unsloth must be imported BEFORE transformers/trl. We
 # defer that import into the stages that touch the model (load/sft/grpo/
@@ -172,6 +174,32 @@ Analyze the board state carefully. Output only a single digit 0-6.
 """
 
 
+# ============================================================================
+# Rewards
+# ============================================================================
+# Last-digit-wins parser. Tolerates native thinking (which may mention
+# column numbers mid-reasoning) and both skip_special_tokens modes:
+# the final answer is whichever 0-6 digit appears last.
+DIGIT_RE = re.compile(r"(?<!\d)([0-6])(?!\d)")
+
+
+def parse_answer(completion):
+    matches = DIGIT_RE.findall(completion)
+    return int(matches[-1]) if matches else None
+
+
+def reward_format(completion, **kwargs):
+    return 5.0 if parse_answer(completion) is not None else -10.0
+
+
+def reward_move_quality(completion, scores, valid_cols, **kwargs):
+    col = parse_answer(completion)
+    if col is None or col not in valid_cols:
+        return -10.0
+    max_abs = max(abs(s) for s in scores) or 1.0
+    return 10.0 * (scores[col] / max_abs)
+
+
 def build_prompt(tokenizer, entry):
     seq = entry["move_sequence"]
     g = reconstruct_board(seq)
@@ -258,6 +286,55 @@ def main():
 
     print(f"=== Connect4 {args.model} / {args.stage} ===")
     print(json.dumps({k: v for k, v in config.items() if "dir" not in k}, indent=2))
+
+    if args.stage == "test-rewards":
+        cases = [
+            ("bare-digit", "3",
+             [0, 0, 0, 0.9, 0, 0, 0], [0, 1, 2, 3, 4, 5, 6]),
+            ("thinking-then-digit",
+             "Let me analyze: Player X threatens in col 3.\n<channel|>3",
+             [0, 0, 0, 0.9, 0, 0, 0], [0, 1, 2, 3, 4, 5, 6]),
+            ("verbose-single-digit", "I think the answer is column 3 obviously",
+             [0, 0, 0, 0.9, 0, 0, 0], [0, 1, 2, 3, 4, 5, 6]),
+            ("wrong", "0",
+             [0, 0, 0, 0.9, 0, 0, 0], [0, 1, 2, 3, 4, 5, 6]),
+            ("invalid-digit", "9",
+             [0, 0, 0, 0.9, 0, 0, 0], [0, 1, 2, 3, 4, 5, 6]),
+            ("no-digit", "the answer",
+             [0, 0, 0, 0.9, 0, 0, 0], [0, 1, 2, 3, 4, 5, 6]),
+            ("invalid-col-in-list", "4",
+             [0.5, 0, 0, 0.9, 0, 0, 0], [0, 1, 2, 3, 5, 6]),
+        ]
+        for name, comp, scores, valid in cases:
+            f = reward_format(comp)
+            q = reward_move_quality(comp, scores, valid)
+            parsed = parse_answer(comp)
+            print(f"[{name:25}] parsed={str(parsed):5} f={f:+.1f} q={q:+.2f}")
+        return
+
+    if args.stage == "test-generate":
+        from unsloth import FastLanguageModel
+        raw = load_csv_data(args.csv)
+        train, _ = split_data(raw)
+        model, tok = load_model_and_tokenizer(config)
+        FastLanguageModel.for_inference(model)
+        for entry in train[:3]:
+            p = build_prompt(tok, entry)
+            inp = tok(p, return_tensors="pt").to("cuda")
+            out = model.generate(
+                **inp, max_new_tokens=1024,
+                temperature=1.0, top_p=0.95, top_k=64, do_sample=True,
+            )
+            raw_decoded = tok.decode(out[0][inp.input_ids.shape[1]:],
+                                     skip_special_tokens=False)
+            clean = tok.decode(out[0][inp.input_ids.shape[1]:],
+                               skip_special_tokens=True)
+            print(f"\n=== seq={entry['move_sequence']!r} best={entry['best_col']} ===")
+            print("--- RAW (special tokens visible) ---")
+            print(raw_decoded)
+            print("--- CLEAN (what rewards see) ---")
+            print(clean)
+        return
 
     if args.stage == "test-prompt":
         raw = load_csv_data(args.csv)
