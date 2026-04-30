@@ -28,7 +28,7 @@ const COLORS = [
   '#b45309', // amber-700
 ];
 
-const getModelColor = (modelName, index) => {
+const getModelColor = (modelName, _index) => {
   if (modelName === 'human') return '#4b5563';
   let hash = 0;
   for (let i = 0; i < modelName.length; i++) {
@@ -257,7 +257,7 @@ const Statistics = () => {
       setAllModels(modelsList);
       if (visibleModels.length === 0) setVisibleModels(modelsList);
     } catch (e) {
-      console.error(e);
+      // Interceptor surfaces the toast.
     } finally {
       setLoading(false);
     }
@@ -269,8 +269,11 @@ const Statistics = () => {
     setLeaderboard([]); // Clear stale data
     setMatrix(null);
     setHistoryData([]);
-    
+
     fetchData();
+    // fetchData closes over dbEnv via the api client interceptor; no need to
+    // include it in deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dbEnv]);
 
   const toggleModelVisibility = (modelName) => {

@@ -9,16 +9,18 @@ import GameStatusBadge from '../components/arena/GameStatusBadge';
 import { GAME_STATUS, PLAYER_TYPE } from '../constants';
 import { getGame, getPendingHumanGames } from '../api/client';
 import { ChevronLeft, ChevronRight, Gamepad2 } from 'lucide-react';
+import { useToast } from '../context/ToastContext';
 
 const Arena = () => {
   const { id } = useParams();
   const gameId = parseInt(id);
   const navigate = useNavigate(); // Hook for navigation
+  const toast = useToast();
   const [meta, setMeta] = useState(null);
   const [replayStep, setReplayStep] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const { gameState, isThinking, isConnected, sendMove } = useGameSocket(gameId);
-  
+
   // NEW: State for actionable games
   const [actionableGames, setActionableGames] = useState([]);
 
@@ -29,7 +31,8 @@ const Arena = () => {
       if (game.status === GAME_STATUS.COMPLETED || game.status === GAME_STATUS.DRAW) {
         setReplayStep(game.history ? game.history.length - 1 : 0);
       }
-    }).catch(console.error);
+    }).catch(() => toast.error('Failed to load game'));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gameId]);
 
   // NEW: Watch for Live Game Completion to trigger Replay Mode
@@ -39,8 +42,9 @@ const Arena = () => {
       getGame(gameId).then((fullGame) => {
         setMeta(fullGame); // This updates status and populates history
         setReplayStep(fullGame.history.length - 1); // Jump to end
-      }).catch(console.error);
+      }).catch(() => toast.error('Failed to load game history'));
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gameState?.status, gameId]);
 
   // Auto-play replay
@@ -59,10 +63,9 @@ const Arena = () => {
   const fetchActionableGames = async () => {
     try {
       const ids = await getPendingHumanGames();
-      console.log("Queue from API:", ids); // <--- Add this debug log
       setActionableGames(ids);
     } catch (error) {
-      console.error("Failed to fetch pending games", error);
+      // Silent — DatabaseContext's response interceptor will surface the toast.
     }
   };
 

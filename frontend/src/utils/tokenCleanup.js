@@ -39,15 +39,19 @@ export const cleanupOldGameTokens = () => {
           cleanedCount++;
         }
       } catch (error) {
-        console.warn(`Error cleaning up token ${key}:`, error);
+        if (import.meta.env.DEV) {
+          // eslint-disable-next-line no-console
+          console.warn(`Error cleaning up token ${key}:`, error);
+        }
       }
     }
   }
-  
-  if (cleanedCount > 0) {
+
+  if (cleanedCount > 0 && import.meta.env.DEV) {
+    // eslint-disable-next-line no-console
     console.log(`Cleaned up ${cleanedCount} old game tokens`);
   }
-  
+
   return cleanedCount;
 };
 

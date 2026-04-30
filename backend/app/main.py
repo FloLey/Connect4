@@ -8,38 +8,49 @@ from contextlib import asynccontextmanager
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+from backend.app.core.config import settings
 from backend.app.core.database import get_db, get_session_maker
-from backend.app.models.game_model import Game
-from backend.app.schemas.game_schema import GameCreate, GameResponse
-from backend.app.api.websocket_manager import manager
-from backend.app.api.stats import router as stats_router
-from backend.app.api.admin import router as admin_router
-from backend.app.api.tournament import router as tournament_router
-from backend.app.core.model_registry import registry
 from backend.app.core.events import game_events
+from backend.app.core.logging import configure_logging, get_logger
+from backend.app.core.model_registry import registry
 from backend.app.engine.elo import update_elo_on_complete
 from backend.app.models.enums import GameStatus, PlayerType
+from backend.app.models.game_model import Game
+from backend.app.schemas.game_schema import GameCreate, GameResponse
+from backend.app.api.admin import router as admin_router
+from backend.app.api.settings_api import router as settings_router
+from backend.app.api.stats import router as stats_router
+from backend.app.api.tournament import router as tournament_router
+from backend.app.api.tournament_ws import router as tournament_ws_router, tournament_ws_manager
+from backend.app.api.websocket_manager import manager
 from backend.app.services.game_runner import game_runner
 from backend.app.services.game_service import GameState, game_service
+from backend.app.services.runtime_settings import runtime_settings
+from backend.app.services.stats_aggregator import refresh_stats_on_complete
 from backend.app.services.tournament_service import tournament_service
+
+configure_logging()
+logger = get_logger(__name__)
 
 # --- LIFESPAN MANAGER (Auto-Resume on Startup) ---
 async def tournament_watcher(env: str):
     """Background task to feed the tournament for specific environment"""
-    print(f"👀 Starting Watcher for [{env}]")
+    logger.info("tournament_watcher_start", env=env)
     SessionLocal = get_session_maker(env)
     from backend.app.services.tournament_bus import tournament_bus
-    
+
     while True:
         try:
-            # Wait for a signal OR a 30s heartbeat safety fallback
-            signal_received = await tournament_bus.wait_for_signal(timeout=30.0)
-            
+            # Wait for a signal OR a heartbeat safety fallback
+            signal_received = await tournament_bus.wait_for_signal(
+                timeout=settings.tournament_watcher_heartbeat_seconds
+            )
+
             async with SessionLocal() as db:
                 # Pass 'env' so service knows which runner to trigger
                 await tournament_service.tick(db, env=env)
         except Exception as e:
-            print(f"Error in {env} watcher: {e}")
+            logger.error("tournament_watcher_error", env=env, error=str(e))
 
 async def resume_games(env: str):
     """Resume interrupted AI vs AI games for a specific environment"""
@@ -52,60 +63,92 @@ async def resume_games(env: str):
         )
         result = await db.execute(query)
         games = result.scalars().all()
-        
+
         for game in games:
-            print(f"▶️ Resuming Game {game.id} in [{env}]")
+            logger.info("resuming_game", game_id=game.id, env=env)
             await game_runner.start_game_if_ai_vs_ai(game.id, env)
 
+async def _cleanup_once(db, cutoff: datetime) -> int:
+    """Mark old non-tournament IN_PROGRESS games as ABANDONED. Returns rowcount.
+
+    Conservative rules:
+    1. Tournament games (tournament_id IS NOT NULL) are left to the tournament
+       system — never touched here.
+    2. Only IN_PROGRESS games older than ``cutoff`` are touched.
+    3. PAUSED games are intentionally waiting for rate-limit cooldown — left.
+
+    Extracted from ``run_cleanup_periodically`` so the SQL can be unit tested
+    against a real DB without spinning up the periodic loop.
+    """
+    result = await db.execute(
+        update(Game)
+        .where(
+            Game.status == GameStatus.IN_PROGRESS,
+            Game.tournament_id.is_(None),
+            Game.created_at < cutoff,
+        )
+        .values(status="ABANDONED")
+    )
+    await db.commit()
+    return result.rowcount
+
+
 async def run_cleanup_periodically():
-    """Periodic background task to clean up abandoned games"""
+    """Periodic background task that wraps ``_cleanup_once``."""
     while True:
-        try: # <--- Wrap logic in a try block INSIDE the while loop
-            await asyncio.sleep(900)  # Run every 15 minutes
+        try:
+            await asyncio.sleep(settings.cleanup_interval_seconds)
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                hours=settings.cleanup_abandon_age_hours
+            )
             for env in ["prod", "test"]:
                 SessionLocal = get_session_maker(env)
                 async with SessionLocal() as db:
-                    # Conservative cleanup rules:
-                    # 1. NEVER clean tournament games (tournament_id IS NOT NULL) - let tournament system handle them
-                    # 2. Only clean regular games (tournament_id IS NULL) after 6 hours
-                    # 3. Never clean PAUSED games (they're intentionally waiting)
-                    
-                    cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
-                    
-                    # Only clean old regular games (non-tournament)
-                    result = await db.execute(
-                        update(Game).where(
-                            Game.status == GameStatus.IN_PROGRESS,
-                            Game.tournament_id.is_(None),  # Only non-tournament games
-                            Game.created_at < cutoff
-                        ).values(status="ABANDONED")
-                    )
-                    cleaned_count = result.rowcount
-                    
-                    await db.commit()
-                    
-                    if cleaned_count > 0:
-                        print(f"🧹 Cleanup: Marked {cleaned_count} regular (non-tournament) games as ABANDONED")
-                    
+                    cleaned = await _cleanup_once(db, cutoff)
+                    if cleaned > 0:
+                        logger.info("cleanup_marked_abandoned", env=env, count=cleaned)
         except Exception as e:
-            print(f"Janitor Task Error: {e}")
-            await asyncio.sleep(60) # Wait a minute before retrying
+            logger.error("cleanup_error", error=str(e))
+            await asyncio.sleep(settings.cleanup_retry_seconds)
+
+async def broadcast_game_completed_on_complete(db, game, winner_id):
+    """Push GAME_COMPLETED to subscribers of the tournament's WS channel.
+
+    Standalone (non-tournament) games are skipped — there's no channel to
+    broadcast to.
+    """
+    if not game.tournament_id:
+        return
+    await tournament_ws_manager.broadcast(
+        game.tournament_id,
+        {"type": "GAME_COMPLETED", "game_id": game.id, "winner": winner_id},
+    )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Wire the event listener
+    # Load runtime settings (API keys + tunable overrides) from the prod DB.
+    # Test env reads its own row when /settings is hit through the test header.
+    SessionLocal = get_session_maker("prod")
+    async with SessionLocal() as db:
+        await runtime_settings.load_from_db(db)
+
+    # Wire the event listeners. ELO writes first; stats aggregator reads the
+    # newly-written EloRating rows, so the order here matters.
     game_events.subscribe_complete(update_elo_on_complete)
-    
+    game_events.subscribe_complete(refresh_stats_on_complete)
+    game_events.subscribe_complete(broadcast_game_completed_on_complete)
+
     # Start BOTH environments
     for env in ["prod", "test"]:
         # 1. Resume interrupted games
         await resume_games(env)
         # 2. Start specific watcher
         asyncio.create_task(tournament_watcher(env))
-    
+
     # Start periodic cleanup task
     asyncio.create_task(run_cleanup_periodically())
-    
+
     yield
     # Shutdown logic (optional)
 # -------------------------------------------------
@@ -115,7 +158,7 @@ app = FastAPI(title="Connect Four LLM Arena", lifespan=lifespan)
 # --- ADD CORS MIDDLEWARE HERE ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"], # Allow Vite (5173) and React default (3000)
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"], # Allow Vite (5173/5174) and React default (3000)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -125,7 +168,9 @@ app.add_middleware(
 # Register routers
 app.include_router(stats_router, prefix="/stats", tags=["Stats"])
 app.include_router(admin_router, prefix="/admin", tags=["Admin"])
+app.include_router(settings_router, prefix="/settings", tags=["Settings"])
 app.include_router(tournament_router, prefix="/tournament", tags=["Tournament"])
+app.include_router(tournament_ws_router, tags=["Tournament"])
 
 # --- NEW ENDPOINT ---
 @app.get("/models")

@@ -8,10 +8,14 @@ even if users close their browsers.
 
 import asyncio
 from sqlalchemy.future import select
+from backend.app.core.config import settings
 from backend.app.core.database import get_session_maker
+from backend.app.core.logging import get_logger
 from backend.app.models.game_model import Game
 from backend.app.models.enums import GameStatus, PlayerType
 from backend.app.services.game_service import game_service, GameState
+
+logger = get_logger(__name__)
 
 
 class GameRunner:
@@ -35,7 +39,7 @@ class GameRunner:
             is_ai_vs_ai = (game.player_1_type != PlayerType.HUMAN and game.player_2_type != PlayerType.HUMAN)
             
             if is_ai_vs_ai and game.status == GameStatus.IN_PROGRESS:
-                print(f"🚀 Starting Background Runner for Game {game_id} in [{env}]")
+                logger.info("background_runner_start", game_id=game_id, env=env)
                 self.running_tasks[key] = asyncio.create_task(self._game_loop(game_id, env))
 
     async def _game_loop(self, game_id: int, env: str):
@@ -47,7 +51,7 @@ class GameRunner:
         try:
             while True:
                 # 1. Brief pause to simulate thinking/pacing
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(settings.game_runner_pacing_seconds)
 
                 SessionLocal = get_session_maker(env)
                 async with SessionLocal() as db:
@@ -71,15 +75,15 @@ class GameRunner:
 
                     # 4. Check Exit Conditions
                     if new_state.winner or new_state.is_draw or new_state.status != GameStatus.IN_PROGRESS:
-                        print(f"🏁 Game {game_id} Finished in background.")
+                        logger.info("background_game_finished", game_id=game_id)
                         break
-                        
+
         except asyncio.CancelledError:
             # Game was paused/cancelled - don't mark as failed, just exit
-            print(f"⏸️ Game {game_id} Paused/Cancelled")
+            logger.info("background_game_cancelled", game_id=game_id)
             raise  # Re-raise to ensure proper cleanup
         except Exception as e:
-            print(f"❌ Background Runner Error (Game {game_id}): {e}")
+            logger.error("background_runner_error", game_id=game_id, error=str(e))
         finally:
             if key in self.running_tasks:
                 del self.running_tasks[key]
@@ -95,7 +99,7 @@ class GameRunner:
         if key in self.running_tasks:
             self.running_tasks[key].cancel()
             del self.running_tasks[key]
-            print(f"🛑 Stopped Background Runner for Game {game_id} in [{env}]")
+            logger.info("background_runner_stopped", game_id=game_id, env=env)
 
 
 # Singleton

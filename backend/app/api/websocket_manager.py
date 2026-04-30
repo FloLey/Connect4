@@ -14,9 +14,12 @@ from typing import Dict, List, Set
 from fastapi import WebSocket
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.services.game_service import game_service, GameState
 from backend.app.core.database import get_session_maker
+from backend.app.core.logging import get_logger
 from backend.app.models.enums import GameStatus, PlayerType
+from backend.app.services.game_service import game_service, GameState
+
+logger = get_logger(__name__)
 
 
 class ConnectionManager:
@@ -111,9 +114,9 @@ class ConnectionManager:
                     
             except ValueError as e:
                 # Invalid move - could send error message to client
-                print(f"Invalid move: {e}")
+                logger.info("invalid_human_move", game_id=game_id, error=str(e))
             except Exception as e:
-                print(f"Error processing human move: {e}")
+                logger.error("human_move_error", game_id=game_id, error=str(e))
 
     async def _check_and_trigger_ai_for_human_vs_ai(self, game_id: int, current_state: GameState, env: str = "prod"):
         """Check if AI should play next and trigger it (ONLY for Human vs AI games)"""
@@ -156,7 +159,7 @@ class ConnectionManager:
                     await self.broadcast(game_id, self._build_state_message(new_state))
                         
         except Exception as e:
-            print(f"AI turn error (Human vs AI): {e}")
+            logger.error("human_vs_ai_turn_error", game_id=game_id, error=str(e))
             await self.broadcast(game_id, {"type": "THINKING_END"})
         finally:
             # 4. RELEASE LOCK

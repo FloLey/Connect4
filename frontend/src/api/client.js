@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = 'http://localhost:8000';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 export const apiClient = axios.create({
   baseURL: API_URL,
@@ -122,6 +122,28 @@ export const updateTournamentConfig = async (tournamentId, concurrency) => {
   });
   return response.data;
 };
+
+// --- Settings (Tier 5 — Settings page) ---
+export const getSettings = async () => {
+  const response = await apiClient.get('/settings');
+  return response.data;
+};
+
+export const patchSettings = async (payload) => {
+  const response = await apiClient.patch('/settings', payload);
+  return response.data;
+};
+
+export const clearApiKey = async (provider) => {
+  const response = await apiClient.delete(`/settings/api-keys/${provider}`);
+  return response.data;
+};
+
+export const clearTunable = async (key) => {
+  const response = await apiClient.delete(`/settings/tunables/${key}`);
+  return response.data;
+};
+// -----------------------------------------
 
 export const createEvaluationTournament = async (target, benchmarks, rounds, concurrency) => {
   const response = await apiClient.post('/tournament/create-evaluation', {

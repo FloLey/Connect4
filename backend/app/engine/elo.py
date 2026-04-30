@@ -1,16 +1,19 @@
 import math
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from backend.app.core.config import settings
+from backend.app.core.logging import get_logger
 from backend.app.models.elo_model import EloRating, EloHistory
 from backend.app.models.game_model import Game
 
-K_FACTOR = 32
+logger = get_logger(__name__)
+
 
 async def get_or_create_rating(db: AsyncSession, model_name: str) -> EloRating:
     result = await db.execute(select(EloRating).where(EloRating.model_name == model_name))
     rating_obj = result.scalar_one_or_none()
     if not rating_obj:
-        rating_obj = EloRating(model_name=model_name, rating=1200.0)
+        rating_obj = EloRating(model_name=model_name, rating=settings.elo_base_rating)
         db.add(rating_obj)
         # We don't commit here, we let the caller commit transactionally
     return rating_obj
@@ -29,7 +32,7 @@ async def update_elo(db: AsyncSession, model_a_name: str, model_b_name: str, win
         select(EloHistory).where(EloHistory.match_id == game_id)
     )
     if existing_history.first():
-        print(f"Skipping ELO update for Game {game_id}: Already processed.")
+        logger.info("elo_update_skipped_idempotent", game_id=game_id)
         return
 
     # 1. Fetch Current Ratings
@@ -55,8 +58,9 @@ async def update_elo(db: AsyncSession, model_a_name: str, model_b_name: str, win
         model_b.draws = (model_b.draws or 0) + 1
 
     # 4. Update Ratings
-    new_rating_a = model_a.rating + K_FACTOR * (score_a - expected_a)
-    new_rating_b = model_b.rating + K_FACTOR * (score_b - expected_b)
+    k = settings.elo_k_factor
+    new_rating_a = model_a.rating + k * (score_a - expected_a)
+    new_rating_b = model_b.rating + k * (score_b - expected_b)
 
     model_a.rating = new_rating_a
     model_b.rating = new_rating_b

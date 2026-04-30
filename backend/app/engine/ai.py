@@ -6,9 +6,13 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from backend.app.core.config import settings
+from backend.app.core.logging import get_logger
 from backend.app.core.model_registry import registry
+from backend.app.engine.rate_limit import rate_limit_detector
 
 load_dotenv()
+logger = get_logger(__name__)
 
 # --- 1. Define Structured Output ---
 class MoveDecision(BaseModel):
@@ -16,12 +20,14 @@ class MoveDecision(BaseModel):
     column: int = Field(description="Column index (0-6).")
     is_fallback: bool = Field(default=False, description="Whether this move was a system fallback due to AI failure.")
 
-def get_llm(model_key: str, temperature: float = 0.2):
+def get_llm(model_key: str, temperature: float | None = None):
     """
     Factory function to return the correct LangChain Chat Model.
     Uses the new provider strategy pattern.
     """
     from backend.app.engine.ai_factory import get_llm as factory_get_llm
+    if temperature is None:
+        temperature = settings.default_temperature
     return factory_get_llm(model_key, temperature)
 
 # --- 3. Prompt Template ---
@@ -52,31 +58,33 @@ prompt = ChatPromptTemplate.from_messages([
 ])
 
 class ConnectFourAI:
-    def __init__(self, player_id: int, model_name: str = "gpt-4o"):
+    def __init__(self, player_id: int, model_name: str | None = None):
+        if model_name is None:
+            model_name = settings.fallback_model
         self.player_id = player_id
         self.opponent_id = 2 if player_id == 1 else 1
         self.symbol = "X" if player_id == 1 else "O"
         self.opp_symbol = "O" if player_id == 1 else "X"
         self.model_name = model_name
-        
+
         try:
             llm = get_llm(model_name)
-            
+
             # Simple divergence: DeepSeek Chat requires explicit function_calling
             # All other models (OpenAI, Anthropic, Google) use auto-mode.
             if "deepseek" in model_name:
                 self.structured_llm = llm.with_structured_output(
-                    MoveDecision, 
-                    method="function_calling", 
+                    MoveDecision,
+                    method="function_calling",
                     include_raw=True
                 )
             else:
                 self.structured_llm = llm.with_structured_output(MoveDecision, include_raw=True)
-            
+
             self.chain = prompt | self.structured_llm
         except Exception as e:
-            print(f"Failed to initialize model {model_name}: {e}")
-            fallback_llm = get_llm("gpt-4o")
+            logger.error("model_init_failed", model_name=model_name, error=str(e))
+            fallback_llm = get_llm(settings.fallback_model)
             self.structured_llm = fallback_llm.with_structured_output(MoveDecision, include_raw=True)
             self.chain = prompt | self.structured_llm
 
@@ -125,16 +133,15 @@ class ConnectFourAI:
             }
 
         except Exception as e:
-            print(f"AI Error ({self.model_name}): {e}")
-            err_msg = str(e).lower()
-            
-            # Check for Rate Limit signatures (Generic + Provider Specific)
-            is_rate_limit = any(x in err_msg for x in ["429", "rate_limit", "rate limit", "throttled", "quota exceeded", "too many requests"])
-            
-            if is_rate_limit:
-                # DO NOT play random move. Escalate to the Service Layer.
-                print(f"⚠️ Rate limit detected for {self.model_name}: {err_msg}")
-                raise e 
+            logger.warning("ai_error", model_name=self.model_name, error=str(e))
+
+            # Provider-aware rate-limit detection (typed exceptions first,
+            # substring fallback last). Escalate to the service layer so it
+            # can snooze the game.
+            rate_limit = rate_limit_detector.detect(e)
+            if rate_limit is not None:
+                logger.warning("rate_limit_detected", model_name=self.model_name)
+                raise rate_limit from e
             
             # Fallback to random move ONLY for parsing/logic errors
             import random

@@ -4,6 +4,8 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from fastapi import Request
 from dotenv import load_dotenv
 
+from backend.app.core.config import settings
+
 load_dotenv()
 
 # Explicitly load both from env
@@ -17,12 +19,12 @@ if not DATABASE_URL or not TEST_DATABASE_URL:
 # Factory for engines
 def create_engine(url):
     return create_async_engine(
-        url, 
-        pool_size=50,         # Match max expected tournament concurrency
-        max_overflow=30,      # Allow temporary spikes
-        pool_timeout=30,      # Wait 30s for a connection before failing
-        pool_recycle=1800, 
-        echo=False
+        url,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout,
+        pool_recycle=settings.db_pool_recycle,
+        echo=False,
     )
 
 engines = {

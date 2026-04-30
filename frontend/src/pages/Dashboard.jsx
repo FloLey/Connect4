@@ -3,36 +3,31 @@ import { Link } from 'react-router-dom';
 import { getLeaderboard, getActiveGames } from '../api/client';
 import { Trophy, Activity, ArrowRight, Hash } from 'lucide-react';
 import { useDatabase } from '../context/DatabaseContext';
+import { usePolling } from '../hooks/usePolling';
 
 const Dashboard = () => {
   const { dbEnv } = useDatabase();
   const [leaderboard, setLeaderboard] = useState([]);
   const [activeGames, setActiveGames] = useState([]);
-  const [loading, setLoading] = useState(true);
 
+  // Reset visible state on dbEnv switch.
   useEffect(() => {
-    setLoading(true);
-    // Optional: Clear data immediately for visual feedback
     setLeaderboard([]);
     setActiveGames([]);
-
-    const fetchData = async () => {
-      try {
-        const [lbData, gamesData] = await Promise.all([
-          getLeaderboard(),
-          getActiveGames()
-        ]);
-        setLeaderboard(lbData);
-        setActiveGames(gamesData);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchData();
-    const interval = setInterval(fetchData, 5000);
-    return () => clearInterval(interval);
   }, [dbEnv]);
+
+  usePolling(
+    async () => {
+      const [lbData, gamesData] = await Promise.all([
+        getLeaderboard(),
+        getActiveGames(),
+      ]);
+      setLeaderboard(lbData);
+      setActiveGames(gamesData);
+    },
+    5000,
+    { deps: [dbEnv] }
+  );
 
   const Card = ({ title, icon: Icon, children, className = "" }) => (
     <div className={`bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 shadow-sm overflow-hidden flex flex-col ${className}`}>

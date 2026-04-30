@@ -1,10 +1,21 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { AlertTriangle, Database, Trash2, RefreshCw, Shield } from 'lucide-react';
+import { AlertTriangle, Database, Trash2, RefreshCw, Shield, Key } from 'lucide-react';
 import { getAdminStatus, resetDatabase } from '../api/client';
+import { useToast } from '../context/ToastContext';
+
+const promptForAdminToken = (current) => {
+  if (typeof window === 'undefined') return null;
+  const next = window.prompt(
+    'Admin token required. Set CONNECT4_ADMIN_TOKEN on the backend and paste the value here.',
+    current ?? ''
+  );
+  return next?.trim() || null;
+};
 
 const Admin = () => {
   const navigate = useNavigate();
+  const toast = useToast();
   const [stats, setStats] = useState(null);
   const [isResetting, setIsResetting] = useState(false);
   const [confirmText, setConfirmText] = useState('');
@@ -13,38 +24,60 @@ const Admin = () => {
 
   useEffect(() => {
     fetchStats();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /**
+   * Run an admin action; on 401, prompt for a token, persist it, retry once.
+   * Pages don't see the token themselves — DatabaseContext's interceptor
+   * picks it up from localStorage on every request.
+   */
+  const withAdminAuth = async (action) => {
+    try {
+      return await action();
+    } catch (error) {
+      if (error?.response?.status !== 401) throw error;
+      const current = localStorage.getItem('admin_token');
+      const next = promptForAdminToken(current);
+      if (!next) throw error;
+      localStorage.setItem('admin_token', next);
+      return await action();
+    }
+  };
 
   const fetchStats = async () => {
     try {
-      const data = await getAdminStatus();
+      const data = await withAdminAuth(getAdminStatus);
       setStats(data);
     } catch (error) {
-      console.error('Failed to fetch admin stats:', error);
+      // Interceptor surfaces the toast.
     } finally {
       setLoading(false);
     }
   };
 
+  const handleClearToken = () => {
+    localStorage.removeItem('admin_token');
+    toast.info('Admin token cleared');
+  };
+
   const handleResetDatabase = async () => {
     if (confirmText !== 'DELETE') {
-      alert('You must type "DELETE" to confirm');
+      toast.error('You must type "DELETE" to confirm');
       return;
     }
 
     setIsResetting(true);
     try {
-      await resetDatabase();
-      alert('Database successfully reset!');
+      await withAdminAuth(resetDatabase);
+      toast.success('Database successfully reset');
       setShowModal(false);
       setConfirmText('');
       await fetchStats(); // Refresh stats
       // Optionally redirect to dashboard
       navigate('/');
     } catch (error) {
-      const errorMessage = error.response?.data?.detail || error.message || 'Network error';
-      alert(`Reset failed: ${errorMessage}`);
-      console.error('Reset error:', error);
+      // Interceptor surfaces the toast.
     } finally {
       setIsResetting(false);
     }
@@ -62,9 +95,19 @@ const Admin = () => {
   return (
     <div className="max-w-4xl mx-auto space-y-6">
       {/* Header */}
-      <div className="flex items-center gap-3">
-        <Shield className="text-brand-600 dark:text-brand-500" size={32} />
-        <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Administration</h1>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <Shield className="text-brand-600 dark:text-brand-500" size={32} />
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Administration</h1>
+        </div>
+        <button
+          type="button"
+          onClick={handleClearToken}
+          title="Clear cached admin token (will re-prompt on next admin action)"
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-gray-300 dark:border-gray-700 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300"
+        >
+          <Key size={14} /> Clear admin token
+        </button>
       </div>
 
       {/* Database Statistics */}

@@ -35,7 +35,7 @@ const History = () => {
       }
       setHasMore(data.length === GAMES_PER_PAGE);
     } catch (e) {
-      console.error('Failed to fetch game history:', e);
+      // Interceptor surfaces the toast.
     } finally {
       setLoading(false);
     }
@@ -65,24 +65,6 @@ const History = () => {
 
   const getPlayerIcon = (playerType) => {
     return playerType === 'human' ? <User size={16} /> : <Cpu size={16} />;
-  };
-
-  const getResultDisplay = (game) => {
-    if (game.status === 'DRAW') {
-      return <span className="text-yellow-400">Draw</span>;
-    }
-    
-    if (game.winner === 1) {
-      return <span className="text-green-400">P1 Win</span>;
-    } else if (game.winner === 2) {
-      return <span className="text-blue-400">P2 Win</span>;
-    }
-    
-    return <span className="text-slate-400">Unknown</span>;
-  };
-
-  const getPlayerName = (playerType) => {
-    return playerType === 'human' ? 'Human' : playerType;
   };
 
   // Helper to sum up stats from history array

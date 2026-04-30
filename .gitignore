@@ -26,3 +26,10 @@ yarn-error.log*
 .dump_config.json
 codebase_dump.txt
 training/solver/target/
+.coverage
+# Test/coverage outputs
+backend/.coverage
+backend/htmlcov/
+backend/.pytest_cache/
+frontend/coverage/
+.dump_config.json

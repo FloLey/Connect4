@@ -2,7 +2,7 @@ import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useTheme } from '../context/ThemeContext';
 import { useDatabase } from '../context/DatabaseContext';
-import { Sun, Moon, LayoutGrid, PlusCircle, History as HistoryIcon, Shield, BarChart2, Trophy } from 'lucide-react';
+import { Sun, Moon, LayoutGrid, PlusCircle, History as HistoryIcon, Shield, BarChart2, Trophy, Sliders } from 'lucide-react';
 
 const Navigation = () => {
   const location = useLocation();
@@ -46,6 +46,7 @@ const Navigation = () => {
             <NavLink to="/statistics" icon={BarChart2} label="Statistics" />
             <NavLink to="/new" icon={PlusCircle} label="New Match" />
             <NavLink to="/history" icon={HistoryIcon} label="History" />
+            <NavLink to="/settings" icon={Sliders} label="Settings" />
             <NavLink to="/admin" icon={Shield} label="Admin" />
           </div>
 

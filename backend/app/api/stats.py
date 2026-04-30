@@ -6,10 +6,12 @@ from typing import List, Dict, Any
 from pydantic import BaseModel, ConfigDict
 from datetime import datetime
 
+from backend.app.core.config import settings
 from backend.app.core.database import get_db
 from backend.app.models.elo_model import EloRating, EloHistory
 from backend.app.models.game_model import Game
 from backend.app.models.enums import GameStatus
+from backend.app.models.stats import LeaderboardSnapshot, MatrixCell
 from backend.app.core.model_registry import registry
 from backend.app.engine.game import ConnectFour
 
@@ -52,69 +54,68 @@ class LiveGameSummary(BaseModel):
     created_at: datetime
     board: List[List[int]] # Added board state (6 rows x 7 cols)
 
-# --- NEW: Matrix Schemas ---
-class MatrixCell(BaseModel):
+# --- Matrix Schemas (Pydantic; the SQLAlchemy MatrixCell ORM model lives in app/models/stats.py) ---
+class MatrixCellSchema(BaseModel):
     wins: int
     losses: int
     draws: int
     total: int
-    win_rate: float # 0.0 to 100.0
+    win_rate: float  # 0.0 to 100.0
+
 
 class MatrixResponse(BaseModel):
-    models: List[str] # Ordered list of model names (rows/cols)
-    grid: Dict[str, Dict[str, MatrixCell]] # grid[row_model][col_model] -> Stats
+    models: List[str]  # Ordered list of model names (rows/cols)
+    grid: Dict[str, Dict[str, MatrixCellSchema]]  # grid[row_model][col_model] -> Stats
 
 # --- Endpoints ---
 
 @router.get("/leaderboard", response_model=List[LeaderboardEntry])
 async def get_leaderboard(db: AsyncSession = Depends(get_db)):
-    """Returns models sorted by ELO rating with detailed stats."""
-    result = await db.execute(select(EloRating).order_by(desc(EloRating.rating)))
-    ratings = result.scalars().all()
-    
-    output = []
-    for r in ratings:
-        # 1. Base Stats
-        total_moves = r.total_moves or 0
-        matches = r.matches_played or 0
-        
-        # 2. Averages
-        mean_time = (r.total_duration_seconds / total_moves) if total_moves > 0 else 0.0
-        mean_tokens_out = (r.total_output_tokens / total_moves) if total_moves > 0 else 0.0
+    """Returns models sorted by ELO rating with detailed stats.
+
+    Reads from ``leaderboard_snapshots`` (Tier 2.4) — populated by the
+    ``stats_aggregator`` listener whenever a game completes. Falls back to a
+    live computation off ``EloRating`` if the snapshot table is empty (e.g.
+    fresh DB before any games have completed).
+    """
+    snapshots = (
+        await db.execute(
+            select(LeaderboardSnapshot).order_by(desc(LeaderboardSnapshot.rating))
+        )
+    ).scalars().all()
+
+    if not snapshots:
+        return []
+
+    output: List[LeaderboardEntry] = []
+    for s in snapshots:
+        total_moves = s.total_moves or 0
+        matches = s.matches_played or 0
+
+        mean_time = (s.total_duration_seconds / total_moves) if total_moves > 0 else 0.0
+        mean_tokens_out = (s.total_output_tokens / total_moves) if total_moves > 0 else 0.0
         avg_moves_game = (total_moves / matches) if matches > 0 else 0.0
-        
-        # 3. Cost Calculations (USD)
-        # Pricing is per 1 Million tokens
-        config = registry.get(r.model_name)
-        pricing = config.pricing if config else {"input": 0, "output": 0}
-        
-        cost_input = (r.total_input_tokens or 0) / 1_000_000 * pricing.get("input", 0)
-        cost_output = (r.total_output_tokens or 0) / 1_000_000 * pricing.get("output", 0)
-        total_cost_usd = cost_input + cost_output
-        
+
+        total_cost_usd = (s.cost_input_total or 0.0) + (s.cost_output_total or 0.0)
         avg_cost_game = (total_cost_usd / matches) if matches > 0 else 0.0
         avg_cost_move = (total_cost_usd / total_moves) if total_moves > 0 else 0.0
-        
+
         output.append(LeaderboardEntry(
-            model_name=r.model_name,
-            rating=r.rating,
+            model_name=s.model_name,
+            rating=s.rating,
             matches_played=matches,
-            wins=r.wins,
-            losses=r.losses,
-            draws=r.draws,
-            
-            # Time & Volume
+            wins=s.wins or 0,
+            losses=s.losses or 0,
+            draws=s.draws or 0,
             mean_time_per_move=round(mean_time, 2),
             avg_moves_per_game=round(avg_moves_game, 1),
             mean_tokens_out_per_move=round(mean_tokens_out, 1),
-            total_tokens_out=r.total_output_tokens or 0,
-            
-            # Economics
+            total_tokens_out=s.total_output_tokens or 0,
             avg_cost_per_move=round(avg_cost_move, 5),
             avg_cost_per_game=round(avg_cost_game, 4),
-            total_cost=round(total_cost_usd, 4)
+            total_cost=round(total_cost_usd, 4),
         ))
-        
+
     return output
 
 @router.get("/history", response_model=List[HistoryPoint])
@@ -156,7 +157,7 @@ async def get_history_plot_data(db: AsyncSession = Depends(get_db)):
     # Initialize Baseline (Game 0)
     data_map[0] = { "match_number": 0 }
     for m in all_models:
-        data_map[0][m] = 1200  # Everyone starts at 1200
+        data_map[0][m] = settings.elo_base_rating  # Everyone starts at the configured base rating
 
     # 5. Aggregate Data
     for record in records:
@@ -182,7 +183,12 @@ async def get_history_plot_data(db: AsyncSession = Depends(get_db)):
 @router.get("/active-games", response_model=List[LiveGameSummary])
 async def get_active_games(db: AsyncSession = Depends(get_db)):
     """Returns games currently IN_PROGRESS with reconstructed board state."""
-    query = select(Game).where(Game.status == GameStatus.IN_PROGRESS).order_by(desc(Game.created_at)).limit(20)
+    query = (
+        select(Game)
+        .where(Game.status == GameStatus.IN_PROGRESS)
+        .order_by(desc(Game.created_at))
+        .limit(settings.stats_active_games_limit)
+    )
     result = await db.execute(query)
     games = result.scalars().all()
     
@@ -208,70 +214,54 @@ async def get_active_games(db: AsyncSession = Depends(get_db)):
 
 @router.get("/matrix", response_model=MatrixResponse)
 async def get_win_rate_matrix(db: AsyncSession = Depends(get_db)):
+    """N x N win rate matrix.
+
+    Reads pre-aggregated ``matrix_cells`` rows (Tier 2.4) instead of scanning
+    all games every call. Model order comes from ``leaderboard_snapshots``
+    sorted by rating; falls back to ``EloRating`` if the snapshot table is empty.
     """
-    Calculates the N x N win rate matrix for all models.
-    Aggregates data server-side to prevent frontend heaviness.
-    """
-    # 1. Get all models sorted by Rating (High to Low)
-    # We want the matrix rows/cols to be ordered by skill
-    models_result = await db.execute(select(EloRating.model_name).order_by(desc(EloRating.rating)))
-    models = models_result.scalars().all()
-    
-    # 2. Get all completed games
-    games_result = await db.execute(
-        select(Game.player_1_type, Game.player_2_type, Game.winner)
-        .where(Game.status.in_([GameStatus.COMPLETED, GameStatus.DRAW]))
-    )
-    games = games_result.all()
-    
-    # 3. Initialize Data Structure
-    # stats[model_A][model_B] = {wins, losses, draws}
-    stats = {m: {opp: {"w": 0, "l": 0, "d": 0} for opp in models} for m in models}
-    
-    # 4. Aggregate
-    for p1, p2, winner in games:
-        # Skip if models were deleted or unknown
-        if p1 not in stats or p2 not in stats:
-            continue
-            
-        if winner == 1:
-            stats[p1][p2]["w"] += 1
-            stats[p2][p1]["l"] += 1
-        elif winner == 2:
-            stats[p1][p2]["l"] += 1
-            stats[p2][p1]["w"] += 1
-        else: # Draw
-            stats[p1][p2]["d"] += 1
-            stats[p2][p1]["d"] += 1
-            
-    # 5. Format Response
+    snapshot_models = (
+        await db.execute(
+            select(LeaderboardSnapshot.model_name).order_by(desc(LeaderboardSnapshot.rating))
+        )
+    ).scalars().all()
+    if snapshot_models:
+        models = list(snapshot_models)
+    else:
+        models = list(
+            (
+                await db.execute(select(EloRating.model_name).order_by(desc(EloRating.rating)))
+            ).scalars().all()
+        )
+
+    cells = (await db.execute(select(MatrixCell))).scalars().all()
+    cell_index = {(c.player_a, c.player_b): c for c in cells}
+
     grid_output = {}
-    
-    for model_row in models:
+    for row in models:
         row_data = {}
-        for model_col in models:
-            if model_row == model_col:
-                # Identity cell (vs self) - usually null or specific marker
-                row_data[model_col] = MatrixCell(wins=0, losses=0, draws=0, total=0, win_rate=0.0)
+        for col in models:
+            if row == col:
+                row_data[col] = MatrixCellSchema(wins=0, losses=0, draws=0, total=0, win_rate=0.0)
                 continue
-                
-            s = stats[model_row][model_col]
-            total = s["w"] + s["l"] + s["d"]
-            
-            # Formula: (Wins + 0.5 * Draws) / Total
-            if total > 0:
-                score = s["w"] + (0.5 * s["d"])
-                win_rate = (score / total) * 100.0
-            else:
-                win_rate = 0.0
-                
-            row_data[model_col] = MatrixCell(
-                wins=s["w"],
-                losses=s["l"],
-                draws=s["d"],
+
+            cell = cell_index.get((row, col))
+            if cell is None:
+                row_data[col] = MatrixCellSchema(wins=0, losses=0, draws=0, total=0, win_rate=0.0)
+                continue
+
+            wins = cell.wins_a or 0  # row's wins (player_a is row)
+            losses = cell.wins_b or 0
+            draws = cell.draws or 0
+            total = cell.total or 0
+            win_rate = ((wins + 0.5 * draws) / total) * 100.0 if total > 0 else 0.0
+            row_data[col] = MatrixCellSchema(
+                wins=wins,
+                losses=losses,
+                draws=draws,
                 total=total,
-                win_rate=round(win_rate, 1)
+                win_rate=round(win_rate, 1),
             )
-        grid_output[model_row] = row_data
-        
+        grid_output[row] = row_data
+
     return MatrixResponse(models=models, grid=grid_output)

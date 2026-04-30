@@ -7,10 +7,36 @@ from sqlalchemy import func, and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from typing import List
 
+from backend.app.api.tournament_ws import tournament_ws_manager
+from backend.app.core.logging import get_logger
+from backend.app.engine.game import ConnectFour
 from backend.app.models.tournament_model import Tournament
 from backend.app.models.game_model import Game
 from backend.app.models.enums import TournamentStatus, GameStatus, PlayerType
 from backend.app.services.game_runner import game_runner
+
+logger = get_logger(__name__)
+
+
+def _summarize_game(game: Game) -> dict:
+    """Shape matches LiveGameSummary in api/stats.py — same key set the
+    frontend already consumes from /stats/active-games."""
+    history = game.history or []
+    if history:
+        engine = ConnectFour.from_history(history)
+        board = engine.board
+    else:
+        board = [[0 for _ in range(7)] for _ in range(6)]
+    return {
+        "id": game.id,
+        "player_1": game.player_1_type,
+        "player_2": game.player_2_type,
+        "move_count": len(history),
+        "created_at": game.created_at.isoformat() if game.created_at else None,
+        "board": board,
+        "status": game.status,
+        "retry_after": game.retry_after.isoformat() if game.retry_after else None,
+    }
 
 class TournamentService:
     async def create_tournament(
@@ -186,8 +212,8 @@ class TournamentService:
         # Stop all running games in GameRunner
         for game in games:
             await game_runner.stop_game(game.id, env)
-        
-        print(f"⏸️ Tournament {tournament_id} Paused ({len(games)} games stopped)")
+
+        logger.info("tournament_paused", tournament_id=tournament_id, games_stopped=len(games))
         return True
 
     async def update_concurrency(self, db: AsyncSession, tournament_id: int, new_concurrency: int):
@@ -202,7 +228,7 @@ class TournamentService:
         flag_modified(t, "config")  # Ensure SQLAlchemy sees the change in the JSONB dict
         
         await db.commit()
-        print(f"⚙️ Tournament {tournament_id} concurrency updated to {new_concurrency}")
+        logger.info("tournament_concurrency_updated", tournament_id=tournament_id, concurrency=new_concurrency)
         return True
 
     async def tick(self, db: AsyncSession, env: str = "prod"):
@@ -232,7 +258,7 @@ class TournamentService:
         if total_unfinished == 0:
             active_tournament.status = TournamentStatus.COMPLETED
             await db.commit()
-            print(f"🏆 Tournament {active_tournament.id} TRULY finished.")
+            logger.info("tournament_completed", tournament_id=active_tournament.id)
             return
 
         concurrency_limit = active_tournament.config.get("concurrency", 1)
@@ -299,12 +325,16 @@ class TournamentService:
                     game.status = GameStatus.IN_PROGRESS
                     await db.commit() # Commit status change first so other workers don't grab it
                 elif game.status == GameStatus.PAUSED:
-                    print(f"🚀 Resuming Game {game.id} after cooldown.")
+                    logger.info("game_resuming_after_cooldown", game_id=game.id)
                     game.status = GameStatus.IN_PROGRESS
                     game.retry_after = None  # Clear the snooze timer
                     await db.commit()
-                
-                print(f"🚀 Tournament Launching: Game {game.id} (Round {game.round_number})")
+
+                logger.info("tournament_launching_game", game_id=game.id, round=game.round_number)
                 await game_runner.start_game_if_ai_vs_ai(game.id, env)
+                await tournament_ws_manager.broadcast(
+                    active_tournament.id,
+                    {"type": "GAME_STARTED", "game": _summarize_game(game)},
+                )
 
 tournament_service = TournamentService()

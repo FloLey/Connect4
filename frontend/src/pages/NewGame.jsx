@@ -3,10 +3,12 @@ import { useNavigate } from 'react-router-dom';
 import { createGame, getModels } from '../api/client';
 import { Bot, User, Sword, Shuffle } from 'lucide-react';
 import { useDatabase } from '../context/DatabaseContext';
+import { useToast } from '../context/ToastContext';
 import { saveGameTokenWithTimestamp } from '../utils/tokenCleanup';
 
 const NewGame = () => {
   const { dbEnv } = useDatabase();
+  const toast = useToast();
   const navigate = useNavigate();
   const [models, setModels] = useState([]); // Dynamic List
   const [loadingModels, setLoadingModels] = useState(true);
@@ -30,7 +32,7 @@ const NewGame = () => {
           setP2Model(data[0].id);
         }
       } catch (error) {
-        console.error("Failed to load models", error);
+        // Interceptor surfaces the toast.
       } finally {
         setLoadingModels(false);
       }
@@ -74,8 +76,7 @@ const NewGame = () => {
       
       navigate(`/game/${game.id}`);
     } catch (error) {
-      console.error(error);
-      alert('Failed to start game');
+      toast.error('Failed to start game');
     } finally {
       setLoading(false);
     }
